@@ -15,6 +15,6 @@ Open the local Vite URL in a browser.
 
 - `A` / `D`: move P1 counterclockwise / clockwise
 - `Space`: charged catch when P1 charge is full
-- `Esc`: pause menu
+- `Esc`: open the arcade HOME menu (pauses the game)
 - `B`: toggle bot fill
 - `R`: reset match

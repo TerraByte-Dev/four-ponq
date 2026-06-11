@@ -283,6 +283,8 @@ class FourPongScene extends Phaser.Scene {
   private homeOverlayOpen = false;
   private pausedByHomeOverlay = false;
   private prevSoundMute = false;
+  private homeMenuRegistered = false;
+  private homeMenuRetryTimer?: number;
 
   constructor() {
     super("four-pong");
@@ -399,6 +401,60 @@ class FourPongScene extends Phaser.Scene {
     rebuildArcs(this.arena(), this.players);
     this.resetRound(undefined, false);
     this.emitHud();
+    this.registerHomeMenu();
+  }
+
+  /**
+   * Register four-ponq's items on the arcade HOME overlay (the single pause +
+   * navigation surface). The overlay is injected by the hub at
+   * /__arcade/home.js and exposes window.__arcadeHomeOverlay. In local dev that
+   * script 404s, so everything here is guarded: if the global (or its v2
+   * registerGameMenu) is absent we retry briefly in case the deferred script
+   * just hasn't run yet, then quietly give up — the game still works standalone.
+   */
+  private registerHomeMenu(attempt = 0) {
+    if (this.homeMenuRegistered) {
+      return;
+    }
+
+    const overlay = window.__arcadeHomeOverlay;
+    if (overlay && typeof overlay.registerGameMenu === "function") {
+      overlay.registerGameMenu({
+        items: [
+          {
+            id: "four-ponq:bot-fill",
+            getLabel: () => (this.botFill ? "Bot Fill: On" : "Bot Fill: Off"),
+            // Stay open so the player sees the label flip in place.
+            closeOnSelect: false,
+            onSelect: () => {
+              this.toggleBotFill();
+            }
+          },
+          {
+            id: "four-ponq:restart-match",
+            label: "Restart Match",
+            closeOnSelect: true,
+            // Only meaningful mid-match; hide it on the attract/menu and
+            // match-over screens (where "Start" already lives in the game UI).
+            disabled: () => this.mode !== "playing" && this.mode !== "paused",
+            onSelect: () => {
+              this.restartMatch();
+            }
+          }
+        ]
+      });
+      this.homeMenuRegistered = true;
+      return;
+    }
+
+    // The overlay script is deferred; if it hasn't run yet, retry a couple of
+    // times (covers the script-loads-after-us race) before giving up.
+    if (attempt < 20) {
+      this.homeMenuRetryTimer = window.setTimeout(() => {
+        this.homeMenuRetryTimer = undefined;
+        this.registerHomeMenu(attempt + 1);
+      }, 100);
+    }
   }
 
   shutdown() {
@@ -413,6 +469,19 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("keydown", this.handleWindowKeyDown);
     window.removeEventListener("arcade:home-open", this.handleHomeOpen);
     window.removeEventListener("arcade:home-close", this.handleHomeClose);
+    if (this.homeMenuRetryTimer !== undefined) {
+      window.clearTimeout(this.homeMenuRetryTimer);
+      this.homeMenuRetryTimer = undefined;
+    }
+    // Pull our items off the shared overlay so a scene restart doesn't leave
+    // stale entries (or double them once create() registers again).
+    if (this.homeMenuRegistered) {
+      const overlay = window.__arcadeHomeOverlay;
+      if (overlay && typeof overlay.clearGameMenu === "function") {
+        overlay.clearGameMenu();
+      }
+      this.homeMenuRegistered = false;
+    }
     this.stopMusic();
   }
 
@@ -975,7 +1044,7 @@ class FourPongScene extends Phaser.Scene {
     }
 
     this.mode = this.mode === "paused" ? "playing" : "paused";
-    this.message = this.mode === "paused" ? "Paused. Press Esc, Space, or Resume." : "Back in motion.";
+    this.message = this.mode === "paused" ? "Paused. Press Space or Resume. Esc opens the arcade menu." : "Back in motion.";
     if (this.mode === "playing") {
       this.resumeRoundIfStalled();
     }
@@ -1169,12 +1238,10 @@ class FourPongScene extends Phaser.Scene {
       return;
     }
 
-    if (event.key === "Escape") {
-      event.preventDefault();
-      this.togglePause();
-      return;
-    }
-
+    // Esc is owned exclusively by the arcade HOME overlay (it opens HOME and
+    // pauses us via the arcade:home-open listener). The game must NOT bind Esc
+    // or the overlay's pause becomes unreachable. Space still toggles pause
+    // while we're not actively playing (e.g. resume from the pause screen).
     if (event.code === "Space" && this.mode !== "playing") {
       event.preventDefault();
       this.togglePause();
@@ -1378,7 +1445,15 @@ bindVolumeInput(musicVolumeInput, "music");
 bindVolumeInput(sfxVolumeInput, "sfx");
 
 pauseButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:toggle-pause"));
+  // Unify on a single pause surface: the on-screen Pause button opens the
+  // arcade HOME overlay (which pauses us via arcade:home-open). In local dev
+  // the overlay script 404s, so fall back to the standalone pause toggle.
+  const overlay = window.__arcadeHomeOverlay;
+  if (overlay && typeof overlay.open === "function") {
+    overlay.open();
+  } else {
+    window.dispatchEvent(new Event("four-pong:toggle-pause"));
+  }
 });
 
 void game;

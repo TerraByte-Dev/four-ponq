@@ -37,7 +37,7 @@ git status -sb
 - P1 uses `A` / `D`; bots fill P2-P4 when enabled.
 - Each player has 5 shields; at 0 shields they are eliminated.
 - Match ends when only one player remains, returning to the menu overlay with `Start Again`.
-- `Esc` pauses and opens the menu overlay.
+- `Esc` opens the arcade HOME overlay, which pauses the game.
 - Center obstacle is a slow-spinning triangle with phase-through handling if the ball gets inside it.
 - Concave rail paddles use matching collision logic.
 - Ball uses substep movement in `advanceBall(dt)` to reduce tunneling through paddles.
