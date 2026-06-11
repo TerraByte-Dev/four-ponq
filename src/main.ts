@@ -34,6 +34,12 @@ import {
   updateArenaRotation,
   updateCaughtBall
 } from "./sim/physics";
+import {
+  NetClient,
+  NET_ARENA_WIDTH,
+  NET_ARENA_HEIGHT,
+  type NetRenderState
+} from "./net/client";
 
 type ThemeId = "neon" | "solar" | "deepSea" | "candy" | "mono";
 type VolumeTarget = "music" | "sfx";
@@ -284,6 +290,16 @@ class FourPongScene extends Phaser.Scene {
   private pausedByHomeOverlay = false;
   private prevSoundMute = false;
 
+  // --- networked multiplayer (Stage 1) ------------------------------------
+  // When `net` is connected with snapshots, update() renders SERVER state
+  // instead of running the local authoritative sim. When it's null/offline,
+  // everything below behaves exactly like the original hot-seat game.
+  private net?: NetClient;
+  /** True once the net client is open AND we have a playable slot. */
+  private networked = false;
+  /** Server-driven status line for the lobby/HUD while networked. */
+  private netStatus = "Connecting to the arcade server…";
+
   constructor() {
     super("four-pong");
   }
@@ -399,6 +415,107 @@ class FourPongScene extends Phaser.Scene {
     rebuildArcs(this.arena(), this.players);
     this.resetRound(undefined, false);
     this.emitHud();
+
+    this.connectNet();
+  }
+
+  /**
+   * Try to join the shared server room. Best-effort: if the socket never opens
+   * (offline dev, server down), `networked` stays false and update() keeps
+   * running the local hot-seat sim — the game is fully playable offline.
+   */
+  private connectNet() {
+    this.net = new NetClient({
+      name: "P1",
+      onEvent: (kind, data) => this.handleNetEvent(kind, data),
+      onChange: () => this.handleNetChange()
+    });
+    this.net.connect();
+  }
+
+  /**
+   * Connection/roster/mode changed. Flips us into (or out of) networked render
+   * mode, mirrors the server's match mode onto the local `mode` so the existing
+   * menu-overlay show/hide logic keeps working, and refreshes the lobby status.
+   */
+  private handleNetChange() {
+    const net = this.net;
+    if (!net) return;
+
+    const open = net.state === "open";
+    const slotted = net.slot >= 0; // -1 = spectator (room full)
+    const nowNetworked = open && slotted;
+
+    if (nowNetworked && !this.networked) {
+      // Entering networked mode: stop the local sim's authority. The local
+      // `mode` now just mirrors the server's so the overlay/HUD behave.
+      this.networked = true;
+    } else if (!nowNetworked && this.networked) {
+      // Lost the server (closed/errored): fall back to the offline sim. Re-serve
+      // so the frozen ball starts moving locally again.
+      this.networked = false;
+      this.mode = "playing";
+      this.resumeRoundIfStalled();
+    }
+
+    if (this.networked) {
+      // Mirror server match mode onto the local enum the renderer/overlay read.
+      // Server modes: lobby | playing | matchOver → local GameMode equivalents.
+      // (We keep a locally-paused state separate; HOME overlay handles that.)
+      if (this.mode !== "paused") {
+        this.mode = net.mode === "playing" ? "playing" : net.mode === "matchOver" ? "matchOver" : "menu";
+      }
+      this.netStatus = this.describeRoom(net);
+      this.message = this.netStatus;
+      this.botFill = net.botFill;
+    }
+
+    this.emitHud();
+  }
+
+  /** Human-readable lobby line: "Connected as P2 · 3 players · waiting". */
+  private describeRoom(net: NetClient): string {
+    if (net.state !== "open") {
+      return "Connecting to the arcade server…";
+    }
+    if (net.slot < 0) {
+      return "Room is full — you're spectating.";
+    }
+    const humans = net.players.filter((p) => !p.isBot && p.connected).length;
+    const roster = net.players
+      .map((p) => `P${p.slot + 1}${p.isBot ? " (bot)" : ""}`)
+      .join(", ");
+    const phase =
+      net.mode === "playing" ? "in play" : net.mode === "matchOver" ? "match over" : "in lobby";
+    return `Connected as P${net.slot + 1} · ${humans} human${humans === 1 ? "" : "s"} · ${roster} · ${phase}`;
+  }
+
+  /**
+   * Server gameplay events → client sound/fx. Authoritative sound: every client
+   * plays the hit/goal/win on receipt so audio matches the server state.
+   */
+  private handleNetEvent(kind: string, _data?: unknown) {
+    switch (kind) {
+      case "ballHit":
+        this.playPaddleHitSound();
+        this.trimBallTrail();
+        break;
+      case "goal":
+      case "eliminated":
+        // Snap the trail so the re-serve reads cleanly; the snapshot drives the
+        // actual ball reset.
+        this.trimBallTrail();
+        break;
+      case "matchOver":
+        this.playWinFanfare();
+        this.spawnWinConfetti(this.players.find((p) => !p.eliminated));
+        break;
+      case "serve":
+        this.paddleImpactBursts = [];
+        this.ballTrail = [];
+        break;
+      // "error" and any unknown kinds are intentionally ignored for sound.
+    }
   }
 
   shutdown() {
@@ -413,6 +530,9 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("keydown", this.handleWindowKeyDown);
     window.removeEventListener("arcade:home-open", this.handleHomeOpen);
     window.removeEventListener("arcade:home-close", this.handleHomeClose);
+    this.net?.close();
+    this.net = undefined;
+    this.networked = false;
     this.stopMusic();
   }
 
@@ -420,6 +540,14 @@ class FourPongScene extends Phaser.Scene {
     const dt = Math.min(delta / 1000, 0.034);
     this.sim.elapsed += delta;
 
+    // NETWORKED PATH: when the server is driving, we do NOT run the local
+    // authoritative sim. We read interpolated server state and render it.
+    if (this.networked) {
+      this.updateNetworked(dt);
+      return;
+    }
+
+    // OFFLINE PATH: unchanged original hot-seat sim.
     if (Phaser.Input.Keyboard.JustDown(this.keys.reset)) {
       this.restartMatch();
     }
@@ -453,6 +581,106 @@ class FourPongScene extends Phaser.Scene {
     this.renderArena();
   }
 
+  /**
+   * The networked render tick. Reads the interpolated server snapshot, writes
+   * it onto the render-facing state (this.ball + this.players' sim fields), and
+   * draws — but never advances any authoritative physics. Local input is
+   * predicted for our own paddle (inside NetClient) and the change is pushed to
+   * the server here.
+   */
+  private updateNetworked(dt: number) {
+    const net = this.net;
+    if (!net) {
+      this.networked = false;
+      return;
+    }
+
+    // 1. Local input → server (change-only) + drive own-paddle prediction.
+    //    While the arcade HOME overlay / pause card is up, we send "no input"
+    //    so a paused owner doesn't keep nudging their paddle on the server.
+    const pausedLocally = this.mode === "paused";
+    const ccw = !pausedLocally && this.keys.counterclockwise.isDown;
+    const cw = !pausedLocally && this.keys.clockwise.isDown;
+    const charge = !pausedLocally && this.keys.pause.isDown;
+    net.sendInput(ccw, cw, charge);
+    net.predict(dt);
+
+    // 2. Pull the interpolated state and project it onto render-facing fields.
+    const render = net.read((x, y) => this.mapServerBall(x, y));
+    if (render) {
+      this.applyNetRenderState(render);
+    }
+
+    // 3. Triangle spin + cosmetic effects are purely visual; keep them lively.
+    stepTriangleMotion(this.sim, dt);
+    this.updateBallTrail();
+    this.updateConfetti(dt);
+    this.updateMusic();
+
+    this.renderArena();
+  }
+
+  /**
+   * Map a server-sim-space ball coordinate (simulated in a fixed canonical
+   * arena, NET_ARENA_WIDTH×NET_ARENA_HEIGHT) into THIS client's render arena.
+   * Paddle angles need no such remap — they're frame-independent — so only the
+   * ball flows through here. Mirrors how handleResize remaps the ball.
+   */
+  private mapServerBall(x: number, y: number): Vec2 {
+    const server = computeArena(NET_ARENA_WIDTH, NET_ARENA_HEIGHT);
+    const local = this.arena();
+    const scale = local.radius / server.radius;
+    return {
+      x: local.center.x + (x - server.center.x) * scale,
+      y: local.center.y + (y - server.center.y) * scale
+    };
+  }
+
+  /**
+   * Write an interpolated server snapshot onto the render-facing state. Slots
+   * map 1:1 to this.players[0..3]. Sets this.ball (drawn directly), each
+   * player's paddleAngle / charge / shields / eliminated (read by the HUD and
+   * paddle/arc drawing), and rebuilds arcs when the elimination set changed so
+   * surviving paddles re-spread like the local sim does.
+   */
+  private applyNetRenderState(render: NetRenderState) {
+    this.ball.set(render.ball.x, render.ball.y);
+
+    let eliminationChanged = false;
+    this.players.forEach((player, slot) => {
+      if (slot < render.paddles.length) {
+        player.paddleAngle = render.paddles[slot];
+      }
+      if (slot < render.charges.length) {
+        player.charge = render.charges[slot];
+      }
+      if (slot < render.shields.length) {
+        player.shields = render.shields[slot];
+      }
+      if (slot < render.eliminated.length) {
+        const next = render.eliminated[slot];
+        if (next !== player.eliminated) {
+          eliminationChanged = true;
+        }
+        player.eliminated = next;
+      }
+    });
+
+    if (eliminationChanged) {
+      // Re-split the circle so the survivors' arcs match the server roster.
+      // rebuildArcs recenters paddleAngle to each arc's middle, so re-apply the
+      // authoritative snapshot angles afterward to avoid a one-frame jump.
+      rebuildArcs(this.arena(), this.players);
+      this.players.forEach((player, slot) => {
+        if (slot < render.paddles.length) {
+          player.paddleAngle = render.paddles[slot];
+        }
+      });
+    }
+
+    this.emitHud();
+  }
+
   private createPlayer(id: number, name: string, color: number, cssColor: string): PlayerState {
     return {
       id,
@@ -472,6 +700,19 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private startGame() {
+    // Networked: "Start" asks the SERVER to start/restart the match. The local
+    // pause card (HOME overlay / Esc) is handled purely locally below.
+    if (this.networked && this.net) {
+      if (this.mode === "paused") {
+        this.mode = "playing";
+        this.message = "Back in motion.";
+        this.emitHud();
+        return;
+      }
+      this.net.sendStart();
+      return;
+    }
+
     if (this.mode === "paused") {
       this.mode = "playing";
       this.message = "Back in motion.";
@@ -840,7 +1081,10 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private currentMusicTrack() {
-    if (this.sim.roundNumber <= 0 || this.mode !== "playing") {
+    // Networked mode never advances the local sim's roundNumber, so gate music
+    // on "server says we're playing" instead. Offline keeps the original gate.
+    const roundLive = this.networked ? this.mode === "playing" : this.sim.roundNumber > 0;
+    if (!roundLive || this.mode !== "playing") {
       return undefined;
     }
 
@@ -995,6 +1239,13 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private toggleBotFill() {
+    // Networked: bot-fill is a server setting; ask the server to flip it and
+    // let the next {t:"room"} echo it back. Don't mutate local sim state.
+    if (this.networked && this.net) {
+      this.net.sendSetBots(!this.net.botFill);
+      return;
+    }
+
     this.botFill = !this.botFill;
     this.message = this.botFill ? "Bot fill on for computer opponents. P1 stays yours." : "Bot fill off. P1 has the circle.";
     this.emitHud();
