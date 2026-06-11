@@ -303,6 +303,16 @@ body {
   display: none;
 }
 
+/*
+ * While the arcade HOME overlay is open it pauses the game, which would
+ * otherwise surface the game's own pause-menu card (it shows whenever
+ * mode !== "playing"). main.ts toggles this body class on arcade:home-open /
+ * arcade:home-close so only the clean HOME overlay is visible — no double menu.
+ */
+body.arcade-home-active #menu-overlay {
+  display: none;
+}
+
 .menu-panel {
   width: min(440px, calc(100vw - 36px));
   max-height: calc(100vh - 208px);
