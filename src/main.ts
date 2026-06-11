@@ -19,7 +19,7 @@ import {
   MAX_SHIELDS,
   TRIANGLE_ROTATION_SPEED
 } from "./sim/constants";
-import { computeArena, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
+import { computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
 import {
   advanceBall,
   applyTriangleGravity,
@@ -38,6 +38,7 @@ import {
   NetClient,
   NET_ARENA_WIDTH,
   NET_ARENA_HEIGHT,
+  COUNTDOWN_SECONDS,
   type NetRenderState
 } from "./net/client";
 
@@ -70,6 +71,45 @@ interface HudState {
   triangleMotionMode: TriangleMotionMode;
   musicVolume: number;
   sfxVolume: number;
+  /**
+   * True while the ONLINE session screens (spectator banner / ready panel /
+   * countdown) own the overlay layer — the legacy offline menu card stays
+   * hidden so the two never stack. The local pause card (Esc) wins over it.
+   */
+  netSession: boolean;
+}
+
+/** One roster row on the online ready screen. */
+interface SessionRowState {
+  slot: number;
+  name: string;
+  isBot: boolean;
+  connected: boolean;
+  ready: boolean;
+  isSelf: boolean;
+  cssColor: string;
+}
+
+/**
+ * Everything the DOM session layer (spectator banner / ready panel / 3-2-1)
+ * renders. Emitted by the scene as "four-pong:session" on every HUD refresh;
+ * the DOM side memoizes so unchanged states cost nothing.
+ */
+interface SessionUiState {
+  /** Slim top banner: watching = "press Space to jump in", pending = "joining at next serve…". */
+  banner: "none" | "watching" | "pending";
+  /** Ready panel (lobby / matchOver ready screen, seated players only). */
+  showReady: boolean;
+  matchOver: boolean;
+  resultLine: string;
+  rows: SessionRowState[];
+  selfReady: boolean;
+  /** Connected humans not yet ready (self included while un-ready). */
+  waitingFor: number;
+  /** Seconds left in the 3-2-1, or null when no countdown is running. */
+  countdown: number | null;
+  /** Seated players get the "Space — cancel" hint under the countdown. */
+  seated: boolean;
 }
 
 interface PaddleImpactBurst {
@@ -126,6 +166,9 @@ const PADDLE_HIT_INDICATOR_GAP = 4;
 const PADDLE_HIT_INDICATOR_FAN_ANGLE = 0.48;
 const PADDLE_HIT_SOUND_COOLDOWN = 500;
 const PADDLE_HIT_SOUND_VOLUME = 0.56;
+/** How long the "that's YOUR paddle" pulse runs after the server seats us (ms). */
+const SEAT_FLASH_DURATION = 2600;
+const COUNTDOWN_TICK_VOLUME = 0.5;
 const PADDLE_HIT_SOUND_KEYS = [
   "paddle-clonk-01",
   "paddle-clonk-02",
@@ -295,10 +338,14 @@ class FourPongScene extends Phaser.Scene {
   // instead of running the local authoritative sim. When it's null/offline,
   // everything below behaves exactly like the original hot-seat game.
   private net?: NetClient;
-  /** True once the net client is open AND we have a playable slot. */
+  /** True once the net client is open — seated player OR spectator. */
   private networked = false;
   /** Server-driven status line for the lobby/HUD while networked. */
   private netStatus = "Connecting to the arcade server…";
+  /** Sim-elapsed deadline for the "this is your paddle" highlight pulse. */
+  private seatFlashUntil = -Infinity;
+  /** Winner line captured at the matchOver event, shown on the ready screen. */
+  private lastResultLine = "";
 
   constructor() {
     super("four-pong");
@@ -389,6 +436,8 @@ class FourPongScene extends Phaser.Scene {
     window.addEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.addEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.addEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.addEventListener("four-pong:join", this.handleJoinEvent);
+    window.addEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.addEventListener("keydown", this.handleWindowKeyDown);
     window.addEventListener("arcade:home-open", this.handleHomeOpen);
     window.addEventListener("arcade:home-close", this.handleHomeClose);
@@ -428,9 +477,21 @@ class FourPongScene extends Phaser.Scene {
     this.net = new NetClient({
       name: "P1",
       onEvent: (kind, data) => this.handleNetEvent(kind, data),
-      onChange: () => this.handleNetChange()
+      onChange: () => this.handleNetChange(),
+      onSeated: (slot) => this.handleSeated(slot)
     });
     this.net.connect();
+  }
+
+  /**
+   * {t:"seated"} landed — we just got a paddle (immediate join from the ready
+   * screen, or the deferred next-serve seat replacing a bot). Pulse a highlight
+   * around OUR paddle so a fresh joiner instantly knows which arc is theirs.
+   */
+  private handleSeated(slot: number) {
+    this.seatFlashUntil = this.elapsed + SEAT_FLASH_DURATION;
+    this.message = `You're in — P${slot + 1} is your paddle.`;
+    this.emitHud();
   }
 
   /**
@@ -442,15 +503,16 @@ class FourPongScene extends Phaser.Scene {
     const net = this.net;
     if (!net) return;
 
+    // Stage 2: ANY open connection is networked — spectators (slot -1) watch
+    // the live server match too; they just render pure interpolation (no
+    // prediction) and get the "jump in" banner instead of inputs.
     const open = net.state === "open";
-    const slotted = net.slot >= 0; // -1 = spectator (room full)
-    const nowNetworked = open && slotted;
 
-    if (nowNetworked && !this.networked) {
+    if (open && !this.networked) {
       // Entering networked mode: stop the local sim's authority. The local
       // `mode` now just mirrors the server's so the overlay/HUD behave.
       this.networked = true;
-    } else if (!nowNetworked && this.networked) {
+    } else if (!open && this.networked) {
       // Lost the server (closed/errored): fall back to the offline sim. Re-serve
       // so the frozen ball starts moving locally again.
       this.networked = false;
@@ -459,11 +521,27 @@ class FourPongScene extends Phaser.Scene {
     }
 
     if (this.networked) {
+      // Mirror the server roster names onto the render players so the HUD and
+      // ready-screen roster agree on who is who.
+      for (const pv of net.players) {
+        const local = this.players[pv.slot];
+        if (local && pv.name) {
+          local.name = pv.name;
+        }
+      }
       // Mirror server match mode onto the local enum the renderer/overlay read.
-      // Server modes: lobby | playing | matchOver → local GameMode equivalents.
-      // (We keep a locally-paused state separate; HOME overlay handles that.)
+      // lobby → "menu", countdown/playing → "playing" (arena live; the 3-2-1 is
+      // session DOM), matchOver → "matchOver". Local pause stays local.
       if (this.mode !== "paused") {
-        this.mode = net.mode === "playing" ? "playing" : net.mode === "matchOver" ? "matchOver" : "menu";
+        this.mode =
+          net.mode === "playing" || net.mode === "countdown"
+            ? "playing"
+            : net.mode === "matchOver"
+              ? "matchOver"
+              : "menu";
+      }
+      if (net.mode === "playing") {
+        this.lastResultLine = ""; // stale winner line must not leak into the next matchOver
       }
       this.netStatus = this.describeRoom(net);
       this.message = this.netStatus;
@@ -479,14 +557,22 @@ class FourPongScene extends Phaser.Scene {
       return "Connecting to the arcade server…";
     }
     if (net.slot < 0) {
-      return "Room is full — you're spectating.";
+      return net.joinPending
+        ? "Joining at the next serve…"
+        : "Watching live — press Space to jump in.";
     }
     const humans = net.players.filter((p) => !p.isBot && p.connected).length;
     const roster = net.players
       .map((p) => `P${p.slot + 1}${p.isBot ? " (bot)" : ""}`)
       .join(", ");
     const phase =
-      net.mode === "playing" ? "in play" : net.mode === "matchOver" ? "match over" : "in lobby";
+      net.mode === "playing"
+        ? "in play"
+        : net.mode === "countdown"
+          ? "starting"
+          : net.mode === "matchOver"
+            ? "match over"
+            : "in lobby";
     return `Connected as P${net.slot + 1} · ${humans} human${humans === 1 ? "" : "s"} · ${roster} · ${phase}`;
   }
 
@@ -506,9 +592,18 @@ class FourPongScene extends Phaser.Scene {
         // actual ball reset.
         this.trimBallTrail();
         break;
-      case "matchOver":
+      case "matchOver": {
         this.playWinFanfare();
-        this.spawnWinConfetti(this.players.find((p) => !p.eliminated));
+        const winner = this.players.find((p) => !p.eliminated);
+        // Capture the winner line NOW (from the final snapshot) — by the time
+        // the matchOver ready screen renders, shields/eliminated may reset.
+        this.lastResultLine = winner ? `${winner.name} takes the match!` : "Match over.";
+        this.spawnWinConfetti(winner);
+        this.emitHud();
+        break;
+      }
+      case "countdownTick":
+        this.playCountdownTick();
         break;
       case "serve":
         this.paddleImpactBursts = [];
@@ -527,6 +622,8 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.removeEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.removeEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.removeEventListener("four-pong:join", this.handleJoinEvent);
+    window.removeEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.removeEventListener("keydown", this.handleWindowKeyDown);
     window.removeEventListener("arcade:home-open", this.handleHomeOpen);
     window.removeEventListener("arcade:home-close", this.handleHomeClose);
@@ -596,14 +693,21 @@ class FourPongScene extends Phaser.Scene {
     }
 
     // 1. Local input → server (change-only) + drive own-paddle prediction.
-    //    While the arcade HOME overlay / pause card is up, we send "no input"
-    //    so a paused owner doesn't keep nudging their paddle on the server.
-    const pausedLocally = this.mode === "paused";
-    const ccw = !pausedLocally && this.keys.counterclockwise.isDown;
-    const cw = !pausedLocally && this.keys.clockwise.isDown;
-    const charge = !pausedLocally && this.keys.pause.isDown;
-    net.sendInput(ccw, cw, charge);
-    net.predict(dt);
+    //    Seated players only — spectators (slot -1) send nothing and render
+    //    pure interpolation. While the arcade HOME overlay / pause card is up,
+    //    or on the ready screen, we send "no input" so a paused/lobbied owner
+    //    doesn't keep nudging their paddle on the server. Charge stays scoped
+    //    to live play so the ready/countdown Space never fires a catch.
+    if (net.slot >= 0) {
+      const pausedLocally = this.mode === "paused";
+      const live = net.mode === "playing" || net.mode === "countdown";
+      const allow = live && !pausedLocally;
+      const ccw = allow && this.keys.counterclockwise.isDown;
+      const cw = allow && this.keys.clockwise.isDown;
+      const charge = allow && net.mode === "playing" && this.keys.pause.isDown;
+      net.sendInput(ccw, cw, charge);
+      net.predict(dt);
+    }
 
     // 2. Pull the interpolated state and project it onto render-facing fields.
     const render = net.read((x, y) => this.mapServerBall(x, y));
@@ -700,8 +804,9 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private startGame() {
-    // Networked: "Start" asks the SERVER to start/restart the match. The local
-    // pause card (HOME overlay / Esc) is handled purely locally below.
+    // Networked: "Start" marks US ready — the SERVER starts the match once all
+    // connected humans are ready (3-2-1 countdown). The local pause card
+    // (HOME overlay / Esc) is handled purely locally below.
     if (this.networked && this.net) {
       if (this.mode === "paused") {
         this.mode = "playing";
@@ -709,7 +814,7 @@ class FourPongScene extends Phaser.Scene {
         this.emitHud();
         return;
       }
-      this.net.sendStart();
+      this.net.sendReady(true);
       return;
     }
 
@@ -860,6 +965,7 @@ class FourPongScene extends Phaser.Scene {
     this.drawPlayerArcs(arena);
     this.drawTriangle(arena, theme);
     this.drawPaddles(arena);
+    this.drawSeatFlash(arena);
     this.drawBallTrail(theme);
     this.drawServeIndicator(theme);
     this.drawPaddleImpactBursts();
@@ -921,6 +1027,35 @@ class FourPongScene extends Phaser.Scene {
       this.gfx.fillPath();
       this.gfx.strokePath();
     }
+  }
+
+  /**
+   * Brief expanding pulse around OUR OWN paddle right after the server seats
+   * us (see handleSeated) — the "which paddle is mine?" answer for someone who
+   * just jumped in from spectating.
+   */
+  private drawSeatFlash(arena: ArenaGeometry) {
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return;
+    }
+    const remaining = this.seatFlashUntil - this.elapsed;
+    if (remaining <= 0) {
+      return;
+    }
+    const player = this.players[net.slot];
+    if (!player || player.eliminated) {
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.02);
+    const fade = Phaser.Math.Clamp(remaining / 600, 0, 1);
+    const pos = paddleCenter(arena, player);
+
+    this.gfx.lineStyle(3, 0xffffff, fade * (0.32 + 0.4 * pulse));
+    this.gfx.strokeCircle(pos.x, pos.y, 26 + pulse * 8);
+    this.gfx.lineStyle(5, player.color, fade * (0.28 + 0.5 * pulse));
+    this.gfx.strokeCircle(pos.x, pos.y, 40 + pulse * 10);
   }
 
   private traceConcavePaddle(arena: ArenaGeometry, player: PlayerState) {
@@ -1053,6 +1188,11 @@ class FourPongScene extends Phaser.Scene {
     this.sound.play(key, { volume: WIN_FANFARE_VOLUME * this.sfxVolume });
   }
 
+  /** 3-2-1 tick — a fixed bright clonk so every second sounds identical. */
+  private playCountdownTick() {
+    this.sound.play("paddle-clonk-06", { volume: COUNTDOWN_TICK_VOLUME * this.sfxVolume });
+  }
+
   private updateMusic() {
     if (this.mode !== "playing") {
       this.pauseMusic();
@@ -1082,8 +1222,9 @@ class FourPongScene extends Phaser.Scene {
 
   private currentMusicTrack() {
     // Networked mode never advances the local sim's roundNumber, so gate music
-    // on "server says we're playing" instead. Offline keeps the original gate.
-    const roundLive = this.networked ? this.mode === "playing" : this.sim.roundNumber > 0;
+    // on "server says we're playing" instead (the 3-2-1 countdown mirrors local
+    // mode "playing" but should stay music-free). Offline keeps the original gate.
+    const roundLive = this.networked ? this.net?.mode === "playing" : this.sim.roundNumber > 0;
     if (!roundLive || this.mode !== "playing") {
       return undefined;
     }
@@ -1438,11 +1579,71 @@ class FourPongScene extends Phaser.Scene {
       return;
     }
 
+    // ONLINE session screens own Space first: spectator jump-in, ready toggle,
+    // countdown cancel. handleSessionSpace returns true only when one of those
+    // screens is active, so in live networked play Space falls through and
+    // stays the charged-catch key (read via this.keys.pause in updateNetworked).
+    if (event.code === "Space" && this.handleSessionSpace()) {
+      event.preventDefault();
+      return;
+    }
+
     // Space still toggles pause while we're not actively playing (e.g. resume
     // from the pause screen).
     if (event.code === "Space" && this.mode !== "playing") {
       event.preventDefault();
       this.togglePause();
+    }
+  };
+
+  /**
+   * Space, scoped to the online session screens. Returns true when consumed:
+   *   - spectator → {t:"join"} ("Jump in?"); ignored while already pending
+   *   - seated on the lobby/matchOver ready screen → toggle {t:"ready"}
+   *   - seated during the 3-2-1 → ready(false), which cancels the countdown
+   * Returns false while offline, locally paused (pause card owns Space), or in
+   * live play (Space is the catch key there).
+   */
+  private handleSessionSpace(): boolean {
+    const net = this.net;
+    if (!this.networked || !net || net.state !== "open") {
+      return false;
+    }
+    if (this.mode === "paused") {
+      return false;
+    }
+    if (net.slot < 0) {
+      if (!net.joinPending) {
+        net.sendJoin();
+      }
+      return true; // consume even while pending — no double-join, no pause leak
+    }
+    if (net.mode === "lobby" || net.mode === "matchOver") {
+      net.sendReady(!(net.self?.ready ?? false));
+      return true;
+    }
+    if (net.mode === "countdown") {
+      net.sendReady(false);
+      return true;
+    }
+    return false;
+  }
+
+  private handleJoinEvent = () => {
+    if (this.networked && this.net && this.net.slot < 0) {
+      this.net.sendJoin();
+    }
+  };
+
+  private handleReadyToggleEvent = () => {
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return;
+    }
+    if (net.mode === "lobby" || net.mode === "matchOver") {
+      net.sendReady(!(net.self?.ready ?? false));
+    } else if (net.mode === "countdown") {
+      net.sendReady(false);
     }
   };
 
@@ -1457,10 +1658,66 @@ class FourPongScene extends Phaser.Scene {
       themeId: this.themeId,
       triangleMotionMode: this.triangleMotionMode,
       musicVolume: this.musicVolume,
-      sfxVolume: this.sfxVolume
+      sfxVolume: this.sfxVolume,
+      netSession: this.networked && this.mode !== "paused"
     };
 
     window.dispatchEvent(new CustomEvent<HudState>("four-pong:hud", { detail: state }));
+    this.emitSession();
+  }
+
+  /**
+   * Project the net-session state into the DOM layer's SessionUiState. All
+   * screens collapse to hidden while offline or locally paused (the pause card
+   * takes the overlay); the HOME overlay hides everything via the
+   * body.arcade-home-active CSS class instead.
+   */
+  private emitSession() {
+    const net = this.net;
+    const state: SessionUiState = {
+      banner: "none",
+      showReady: false,
+      matchOver: false,
+      resultLine: "",
+      rows: [],
+      selfReady: false,
+      waitingFor: 0,
+      countdown: null,
+      seated: false
+    };
+
+    if (this.networked && net && net.state === "open" && this.mode !== "paused") {
+      state.seated = net.slot >= 0;
+
+      if (net.slot < 0) {
+        state.banner = net.joinPending ? "pending" : "watching";
+      }
+
+      if (net.mode === "countdown") {
+        state.countdown = net.countdown ?? COUNTDOWN_SECONDS;
+      }
+
+      if (net.slot >= 0 && (net.mode === "lobby" || net.mode === "matchOver")) {
+        state.showReady = true;
+        state.matchOver = net.mode === "matchOver";
+        state.resultLine = state.matchOver ? this.lastResultLine || "Match over." : "";
+        state.rows = [...net.players]
+          .sort((a, b) => a.slot - b.slot)
+          .map((p) => ({
+            slot: p.slot,
+            name: p.name || `P${p.slot + 1}`,
+            isBot: p.isBot,
+            connected: p.connected,
+            ready: p.ready,
+            isSelf: p.slot === net.slot,
+            cssColor: this.players[p.slot]?.cssColor ?? "#ffffff"
+          }));
+        state.selfReady = net.self?.ready ?? false;
+        state.waitingFor = net.players.filter((p) => !p.isBot && p.connected && !p.ready).length;
+      }
+    }
+
+    window.dispatchEvent(new CustomEvent<SessionUiState>("four-pong:session", { detail: state }));
   }
 }
 
@@ -1516,6 +1773,46 @@ const menuMusicVolume = document.querySelector<HTMLElement>("#menu-music-volume"
 const menuSfxVolume = document.querySelector<HTMLElement>("#menu-sfx-volume")!;
 const menuMusicState = document.querySelector<HTMLElement>("#menu-music-state")!;
 
+// --- Online session layer (Stage 2) -----------------------------------------
+// Spectator banner + ready panel + 3-2-1 countdown, injected next to the other
+// overlays and driven entirely by "four-pong:session" events from the scene.
+// Styled with the same dark panel tokens as the rest of the shell (styles.css).
+document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
+  "beforeend",
+  `<div id="session-overlay" hidden>
+    <div class="session-banner" id="session-banner" hidden>
+      <span class="live-dot" aria-hidden="true"></span>
+      <span id="session-banner-text">LIVE — watching</span>
+      <button id="session-join-button" type="button">Jump In (Space)</button>
+    </div>
+    <div class="session-panel" id="session-ready-panel" role="dialog" aria-label="Online lobby" hidden>
+      <span class="mode-kicker" id="session-kicker">Online lobby</span>
+      <h2 id="session-result" hidden></h2>
+      <ul id="session-roster"></ul>
+      <button id="session-ready-button" type="button">Ready (Space)</button>
+      <p id="session-status">Press Space when you're ready.</p>
+    </div>
+    <div class="session-countdown" id="session-countdown" hidden>
+      <span id="session-countdown-number">3</span>
+      <span class="session-countdown-hint" id="session-countdown-hint">Space — cancel</span>
+    </div>
+  </div>`
+);
+
+const sessionOverlay = document.querySelector<HTMLDivElement>("#session-overlay")!;
+const sessionBanner = document.querySelector<HTMLDivElement>("#session-banner")!;
+const sessionBannerText = document.querySelector<HTMLSpanElement>("#session-banner-text")!;
+const sessionJoinButton = document.querySelector<HTMLButtonElement>("#session-join-button")!;
+const sessionReadyPanel = document.querySelector<HTMLDivElement>("#session-ready-panel")!;
+const sessionKicker = document.querySelector<HTMLSpanElement>("#session-kicker")!;
+const sessionResult = document.querySelector<HTMLHeadingElement>("#session-result")!;
+const sessionRoster = document.querySelector<HTMLUListElement>("#session-roster")!;
+const sessionReadyButton = document.querySelector<HTMLButtonElement>("#session-ready-button")!;
+const sessionStatus = document.querySelector<HTMLParagraphElement>("#session-status")!;
+const sessionCountdown = document.querySelector<HTMLDivElement>("#session-countdown")!;
+const sessionCountdownNumber = document.querySelector<HTMLSpanElement>("#session-countdown-number")!;
+const sessionCountdownHint = document.querySelector<HTMLSpanElement>("#session-countdown-hint")!;
+
 window.addEventListener("four-pong:hud", (event) => {
   const state = (event as CustomEvent<HudState>).detail;
   scoreStrip.innerHTML = state.players.map((player) => {
@@ -1525,7 +1822,7 @@ window.addEventListener("four-pong:hud", (event) => {
     }).join("");
     const charge = Phaser.Math.Clamp(player.charge / MAX_CHARGE, 0, 1);
     return `<article class="score-card ${player.eliminated ? "out" : ""}">
-      <span class="name" style="--player-color: ${player.cssColor}">${player.name}</span>
+      <span class="name" style="--player-color: ${player.cssColor}">${escapeHtml(player.name)}</span>
       <span class="pips">${shields}</span>
       <span class="charge-meter" aria-label="${player.name} charge ${player.charge} of ${MAX_CHARGE}">
         <span style="--player-color: ${player.cssColor}; --charge: ${charge}"></span>
@@ -1536,7 +1833,10 @@ window.addEventListener("four-pong:hud", (event) => {
   statusChip.textContent = `${state.message} ${state.botFill ? "Bot fill on." : "Bot fill off."}`;
   pauseButton.textContent = state.mode === "paused" ? "Resume" : "Pause";
   pauseButton.disabled = state.mode === "menu" || state.mode === "matchOver";
-  menuOverlay.hidden = state.mode === "playing";
+  // Hide the legacy offline menu card while playing AND while the online
+  // session screens own the overlay layer (ready panel/banner/countdown). The
+  // local pause card (mode "paused" → netSession false) still shows it.
+  menuOverlay.hidden = state.mode === "playing" || state.netSession;
   startButton.textContent = state.mode === "paused" ? "Resume" : state.mode === "matchOver" ? "Start Again" : "Start";
   botToggleButton.textContent = state.botFill ? "Bot Fill: On" : "Bot Fill: Off";
   menuBotState.textContent = state.botFill ? "On" : "Off";
@@ -1572,6 +1872,85 @@ window.addEventListener("four-pong:hud", (event) => {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
   });
+});
+
+// --- Online session renderer -------------------------------------------------
+// The scene emits "four-pong:session" on every HUD refresh (which, while
+// networked, is every frame) — memoize on the serialized state so the DOM only
+// changes when the session actually does.
+let lastSessionKey = "";
+
+window.addEventListener("four-pong:session", (event) => {
+  const s = (event as CustomEvent<SessionUiState>).detail;
+  const key = JSON.stringify(s);
+  if (key === lastSessionKey) {
+    return;
+  }
+  lastSessionKey = key;
+
+  sessionOverlay.hidden = s.banner === "none" && !s.showReady && s.countdown === null;
+  sessionBanner.hidden = s.banner === "none";
+  sessionReadyPanel.hidden = !s.showReady;
+  sessionCountdown.hidden = s.countdown === null;
+
+  if (s.banner === "watching") {
+    sessionBannerText.textContent = "LIVE — watching · press Space to jump in";
+    sessionJoinButton.hidden = false;
+  } else if (s.banner === "pending") {
+    sessionBannerText.textContent = "Joining at next serve…";
+    sessionJoinButton.hidden = true;
+  }
+
+  if (s.showReady) {
+    sessionKicker.textContent = s.matchOver ? "Match over" : "Online lobby";
+    sessionResult.hidden = !s.matchOver;
+    sessionResult.textContent = s.resultLine;
+    sessionRoster.innerHTML = s.rows
+      .map((row) => {
+        const tag = row.isBot
+          ? `<span class="tag bot">BOT</span>`
+          : !row.connected
+            ? `<span class="tag offline">OFFLINE</span>`
+            : row.ready
+              ? `<span class="tag ready">READY</span>`
+              : `<span class="tag waiting">&hellip;</span>`;
+        return `<li class="${row.isSelf ? "self" : ""}" style="--player-color: ${row.cssColor}">
+          <span class="seat">P${row.slot + 1}</span>
+          <span class="player-name">${escapeHtml(row.name)}${row.isSelf ? " (you)" : ""}</span>
+          ${tag}
+        </li>`;
+      })
+      .join("");
+    sessionReadyButton.textContent = s.selfReady ? "Ready ✓ (Space to cancel)" : "Ready (Space)";
+    sessionReadyButton.classList.toggle("armed", s.selfReady);
+    sessionStatus.textContent = !s.selfReady
+      ? "Press Space when you're ready."
+      : s.waitingFor > 0
+        ? `Waiting for ${s.waitingFor} more player${s.waitingFor === 1 ? "" : "s"}…`
+        : "All set — starting…";
+  }
+
+  if (s.countdown !== null) {
+    sessionCountdownHint.hidden = !s.seated;
+    const text = String(Math.max(1, Math.ceil(s.countdown)));
+    if (sessionCountdownNumber.textContent !== text) {
+      sessionCountdownNumber.textContent = text;
+      // Restart the pop animation for each new digit.
+      sessionCountdownNumber.classList.remove("pop");
+      void sessionCountdownNumber.offsetWidth;
+      sessionCountdownNumber.classList.add("pop");
+    }
+  }
+});
+
+sessionJoinButton.addEventListener("click", () => {
+  window.dispatchEvent(new Event("four-pong:join"));
+  sessionJoinButton.blur(); // keep a later Space from re-clicking the button
+});
+
+sessionReadyButton.addEventListener("click", () => {
+  window.dispatchEvent(new Event("four-pong:ready-toggle"));
+  sessionReadyButton.blur(); // Space must hit the window handler, not this button
 });
 
 startButton.addEventListener("click", () => {
@@ -1653,4 +2032,14 @@ void game;
 
 function titleCase(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
+/** Server-provided names flow into innerHTML — escape them. */
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

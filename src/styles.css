@@ -628,6 +628,272 @@ body.arcade-home-active #menu-overlay {
   background: linear-gradient(135deg, #f8f9fa 0 33%, #b8c3c7 33% 66%, #69757c 66%);
 }
 
+/* --- Online session layer (Stage 2): spectator banner, ready panel, 3-2-1 --- */
+
+#session-overlay {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 112px 18px 96px;
+  pointer-events: none;
+}
+
+#session-overlay[hidden] {
+  display: none;
+}
+
+/* The arcade HOME overlay owns the screen while open — same rule as the
+   offline menu card above. */
+body.arcade-home-active #session-overlay {
+  display: none;
+}
+
+.session-banner {
+  position: absolute;
+  top: 96px;
+  top: max(96px, calc(env(safe-area-inset-top) + 82px));
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 24px);
+  padding: 9px 12px;
+  pointer-events: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.session-banner[hidden] {
+  display: none;
+}
+
+.live-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--hot);
+  box-shadow: 0 0 10px var(--hot);
+  animation: session-live-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes session-live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+#session-join-button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  color: #031018;
+  background: var(--cool);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 850;
+  cursor: pointer;
+  box-shadow: 0 0 18px rgba(98, 230, 255, 0.22);
+}
+
+#session-join-button[hidden] {
+  display: none;
+}
+
+#session-join-button:hover {
+  filter: brightness(1.08);
+}
+
+.session-panel {
+  width: min(400px, calc(100vw - 36px));
+  max-height: calc(100vh - 208px);
+  max-height: calc(100dvh - 208px);
+  overflow-y: auto;
+  padding: 22px;
+  pointer-events: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+}
+
+.session-panel[hidden] {
+  display: none;
+}
+
+#session-result {
+  margin: 12px 0 2px;
+  color: var(--text);
+  font-size: 1.45rem;
+  line-height: 1.1;
+}
+
+#session-result[hidden] {
+  display: none;
+}
+
+#session-roster {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+#session-roster li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+#session-roster li.self {
+  box-shadow: inset 0 0 0 1px var(--player-color);
+}
+
+#session-roster .seat {
+  min-width: 26px;
+  color: var(--player-color);
+  font-weight: 850;
+}
+
+#session-roster .player-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#session-roster .tag {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+}
+
+#session-roster .tag.ready {
+  color: #031018;
+  background: var(--cool);
+  box-shadow: 0 0 12px rgba(98, 230, 255, 0.3);
+}
+
+#session-roster .tag.waiting {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#session-roster .tag.bot {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.24);
+}
+
+#session-roster .tag.offline {
+  color: var(--hot);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+#session-ready-button {
+  width: 100%;
+  min-height: 48px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #031018;
+  background: var(--cool);
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 850;
+  cursor: pointer;
+  box-shadow: 0 0 26px rgba(98, 230, 255, 0.24);
+}
+
+#session-ready-button:hover {
+  filter: brightness(1.08);
+}
+
+#session-ready-button.armed {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--cool);
+  box-shadow: inset 0 0 14px rgba(98, 230, 255, 0.12);
+}
+
+#session-status {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 650;
+  text-align: center;
+}
+
+.session-countdown {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.session-countdown[hidden] {
+  display: none;
+}
+
+#session-countdown-number {
+  color: var(--text);
+  font-size: clamp(5.4rem, 20vw, 10rem);
+  font-weight: 900;
+  line-height: 1;
+  text-shadow: 0 0 38px var(--glow-a), 0 0 70px var(--glow-b);
+}
+
+#session-countdown-number.pop {
+  animation: session-count-pop 320ms ease-out;
+}
+
+@keyframes session-count-pop {
+  from {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.session-countdown-hint {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.session-countdown-hint[hidden] {
+  display: none;
+}
+
 @media (max-width: 760px) {
   #hud {
     top: 10px;
@@ -726,5 +992,26 @@ body.arcade-home-active #menu-overlay {
   .menu-details {
     grid-template-columns: 1fr;
     font-size: 0.72rem;
+  }
+
+  /* The mobile HUD stacks vertically and gets tall — drop the spectator banner
+     to the bottom, above the controls strip, instead of fighting it up top. */
+  .session-banner {
+    top: auto;
+    bottom: 124px;
+    bottom: max(124px, calc(114px + env(safe-area-inset-bottom)));
+    max-width: calc(100vw - 20px);
+    white-space: normal;
+    text-align: center;
+  }
+
+  #session-overlay {
+    padding: 156px 10px 116px;
+  }
+
+  .session-panel {
+    max-height: calc(100vh - 284px);
+    max-height: calc(100dvh - 284px);
+    padding: 18px;
   }
 }

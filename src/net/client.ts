@@ -20,9 +20,14 @@
  * remap via NetClient.ballRenderPos() using the shared canonical arena below.
  */
 
-import type { ClientMsg, ServerMsg, PlayerView } from "../../shared/protocol";
-import { SNAP_HZ, MAX_PLAYERS } from "../../shared/protocol";
+import type { ClientMsg, ServerMsg, PlayerView, RoomMode } from "../../shared/protocol";
+import { SNAP_HZ, MAX_PLAYERS, COUNTDOWN_SECONDS } from "../../shared/protocol";
 import { TAU } from "../sim/math";
+
+// Re-export the session-layer types/constants main.ts needs so the scene keeps
+// a single import source for everything network-shaped.
+export type { PlayerView, RoomMode };
+export { COUNTDOWN_SECONDS };
 
 /**
  * Canonical server arena size. The SERVER must run its authoritative sim with
@@ -50,8 +55,6 @@ const RECONCILE_RATE = 0.25;
 const RECONCILE_SNAP_EPSILON = 0.0008;
 
 export type ConnState = "connecting" | "open" | "closed" | "error";
-
-export type RoomMode = "lobby" | "playing" | "matchOver";
 
 /** One buffered snapshot, timestamped on arrival (client clock). */
 interface BufferedSnap {
@@ -83,6 +86,12 @@ export interface NetClientOptions {
   onEvent?: (kind: string, data?: unknown) => void;
   /** Fired whenever connection state, slot, roster, or mode changes. */
   onChange?: () => void;
+  /**
+   * Fired on {t:"seated"} — we just got a paddle (immediate join from the
+   * ready screen, or the deferred next-serve seat). onChange also fires;
+   * this exists so the scene can run one-shot "that's YOUR paddle" feedback.
+   */
+  onSeated?: (slot: number) => void;
 }
 
 export class NetClient {
@@ -95,6 +104,10 @@ export class NetClient {
   private _players: PlayerView[] = [];
   private _mode: RoomMode = "lobby";
   private _botFill = true;
+  /** Seconds remaining in the ready-screen countdown (mode === "countdown" only). */
+  private _countdown: number | undefined;
+  /** True between {t:"joinPending"} and the deferred {t:"seated"} at next serve. */
+  private _joinPending = false;
 
   /** Most-recent-last ring of snapshots, used for interpolation. */
   private snaps: BufferedSnap[] = [];
@@ -165,6 +178,20 @@ export class NetClient {
     this.send({ t: "input", ccw, cw, charge });
   }
 
+  /** Spectator → "Jump in?". No-op while a deferred seat is already pending. */
+  sendJoin(): void {
+    if (this._joinPending) {
+      return;
+    }
+    this.send({ t: "join" });
+  }
+
+  /** Ready-screen toggle. ready(false) during a countdown cancels it. */
+  sendReady(on: boolean): void {
+    this.send({ t: "ready", on });
+  }
+
+  /** Legacy alias — the server treats {t:"start"} as {t:"ready", on:true}. */
   sendStart(): void {
     this.send({ t: "start" });
   }
@@ -192,7 +219,8 @@ export class NetClient {
     switch (msg.t) {
       case "welcome": {
         this._clientId = msg.clientId;
-        this._slot = msg.slot;
+        this._slot = msg.slot; // -1 = spectator (live match or full room)
+        this._joinPending = false;
         // Reset prediction whenever our slot identity changes.
         this.hasPrediction = false;
         this.lastSentInput = null;
@@ -203,7 +231,24 @@ export class NetClient {
         this._players = msg.players;
         this._mode = msg.mode;
         this._botFill = msg.botFill;
+        this._countdown = msg.mode === "countdown" ? msg.countdown : undefined;
         this.opts.onChange?.();
+        break;
+      }
+      case "joinPending": {
+        // Join acknowledged; we get {t:"seated"} at the next serve.
+        this._joinPending = true;
+        this.opts.onChange?.();
+        break;
+      }
+      case "seated": {
+        // Spectator → player. Prediction restarts from the next snapshot.
+        this._slot = msg.slot;
+        this._joinPending = false;
+        this.hasPrediction = false;
+        this.lastSentInput = null;
+        this.opts.onChange?.();
+        this.opts.onSeated?.(msg.slot);
         break;
       }
       case "snap": {
@@ -378,6 +423,22 @@ export class NetClient {
   }
   get botFill(): boolean {
     return this._botFill;
+  }
+  /** Seconds left in the 3-2-1 (only meaningful while mode === "countdown"). */
+  get countdown(): number | undefined {
+    return this._countdown;
+  }
+  /** True while waiting to be seated at the next serve. */
+  get joinPending(): boolean {
+    return this._joinPending;
+  }
+  /** True when connected without a paddle (watching the live match). */
+  get isSpectator(): boolean {
+    return this._slot < 0;
+  }
+  /** Our own roster entry (ready flag etc.), if seated. */
+  get self(): PlayerView | undefined {
+    return this._slot >= 0 ? this._players.find((p) => p.slot === this._slot) : undefined;
   }
   get snapHz(): number {
     return SNAP_HZ;
