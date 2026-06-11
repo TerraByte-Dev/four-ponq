@@ -1,33 +1,48 @@
 import Phaser from "phaser";
 import "./styles.css";
+import { TAU, type Vec2 } from "./sim/math";
+import type {
+  ArenaGeometry,
+  BotDifficulty,
+  GameMode,
+  GameVariant,
+  PlayerInput,
+  SimEvent,
+  SimPlayer,
+  SimState,
+  TriangleMotionMode
+} from "./sim/types";
+import {
+  BALL_RADIUS,
+  MAX_BALL_SPEED,
+  MAX_CHARGE,
+  MAX_SHIELDS,
+  TRIANGLE_ROTATION_SPEED
+} from "./sim/constants";
+import { computeArena, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
+import {
+  advanceBall,
+  applyTriangleGravity,
+  clearCatchState,
+  clearTouchState,
+  createSimState,
+  resetRound as simResetRound,
+  stepCaughtBall,
+  stepMenuPreview,
+  stepPaddles,
+  stepTriangleMotion,
+  updateArenaRotation,
+  updateCaughtBall
+} from "./sim/physics";
 
-type GameMode = "menu" | "playing" | "paused" | "matchOver";
-type BotDifficulty = "easy" | "medium" | "hard";
-type TouchType = "none" | "player" | "triangle";
 type ThemeId = "neon" | "solar" | "deepSea" | "candy" | "mono";
-type TriangleMotionMode = "steady" | "reactive";
-type GameVariant = "classic" | "rotating";
 type VolumeTarget = "music" | "sfx";
 
-interface InputAction {
-  counterclockwise: boolean;
-  clockwise: boolean;
-}
-
-interface PlayerState {
-  id: number;
+/** Scene-side player: the pure sim fields (SimPlayer) plus render-only identity. */
+interface PlayerState extends SimPlayer {
   name: string;
   color: number;
   cssColor: string;
-  shields: number;
-  eliminated: boolean;
-  paddleAngle: number;
-  arcStart: number;
-  arcEnd: number;
-  humanControlled: boolean;
-  lastHumanInputAt: number;
-  charge: number;
-  paddleAssistMultiplier: number;
 }
 
 interface HudPlayerState {
@@ -49,14 +64,6 @@ interface HudState {
   triangleMotionMode: TriangleMotionMode;
   musicVolume: number;
   sfxVolume: number;
-}
-
-interface ArenaGeometry {
-  center: Phaser.Math.Vector2;
-  radius: number;
-  paddleThickness: number;
-  paddleAngleSpan: number;
-  triangleRadius: number;
 }
 
 interface PaddleImpactBurst {
@@ -84,21 +91,6 @@ interface ConfettiParticle {
   lifetime: number;
 }
 
-interface PaddleCollisionHit {
-  contact: Phaser.Math.Vector2;
-  normal: Phaser.Math.Vector2;
-  radial: Phaser.Math.Vector2;
-  offset: number;
-  penetration: number;
-  crossed: boolean;
-}
-
-interface PaddleSegment {
-  start: Phaser.Math.Vector2;
-  end: Phaser.Math.Vector2;
-  offset: number;
-}
-
 interface ThemeDefinition {
   id: ThemeId;
   name: string;
@@ -115,44 +107,12 @@ interface ThemeDefinition {
   playerColors: Array<{ color: number; cssColor: string }>;
 }
 
-const MAX_SHIELDS = 5;
-const BALL_RADIUS = 10;
-const TAU = Math.PI * 2;
-const TRIANGLE_GRAVITY = 21000;
-const TRIANGLE_ROTATION_SPEED = 0.34;
-const TRIANGLE_REACTIVE_DAMPING = 0.997;
-const TRIANGLE_REACTIVE_MIN_SPEED = 0.12;
-const TRIANGLE_REACTIVE_MAX_SPEED = 3.05;
-const TRIANGLE_PHASE_DELAY = 1000;
-const PADDLE_CURVE_RESPONSE = 0.72;
-const PADDLE_RELEASE_GAP = 2.5;
-const PADDLE_CONCAVITY = 0.48;
-const PADDLE_WING_LENGTH_MIN = 16;
-const PADDLE_WING_LENGTH_RATIO = 0.045;
-const MAX_CHARGE = 10;
-const REPEAT_HIT_BOOST = 1.08;
-const CATCH_DURATION = 3000;
-const CATCH_LAUNCH_BOOST = 2;
-const SPAWN_DELAY = 850;
-const BASE_BALL_SPEED = 380;
-const MENU_BALL_SPEED = 180;
-const BASE_PADDLE_SPEED = 2.3625;
-const PADDLE_SPEED_RAMP = 0.045;
-const MAX_PADDLE_SPEED_MULTIPLIER = 1.36;
-const PADDLE_MOVE_ASSIST = 0.1;
-const PADDLE_ASSIST_ACCELERATION = 6.5;
-const PADDLE_ASSIST_DECELERATION = 9.5;
-const ROTATING_VARIANT_PADDLE_SPEED_BOOST = 1.05;
-const ARENA_ROTATION_SPEED = 0.18;
-const MAX_BALL_SPEED = 840;
-const MAX_CHARGED_BALL_SPEED = 980;
+// Gameplay/tuning constants live in src/sim/constants.ts now — only
+// render/audio-facing constants remain here.
 const SERVE_INDICATOR_LIFETIME = 1700;
 const SERVE_INDICATOR_LENGTH = 62;
 const BALL_TRAIL_LIFETIME = 360;
 const BALL_TRAIL_SAMPLE_DISTANCE = 10;
-const ARC_BARRIER_HALF_ANGLE = 0.04125;
-const ARC_BARRIER_INSET = 6;
-const ARC_BARRIER_THICKNESS = 15;
 const CONFETTI_LIFETIME = 1500;
 const PADDLE_HIT_INDICATOR_LIFETIME = 170;
 const PADDLE_HIT_INDICATOR_LENGTH = 34;
@@ -192,12 +152,6 @@ const MUSIC_TRACKS = [
     file: "04-round-four-home-stretch-chill-drums-half-bell.wav"
   }
 ] as const;
-
-const BOT_DIFFICULTY_SPEED: Record<BotDifficulty, number> = {
-  easy: 0.42,
-  medium: 0.68,
-  hard: 0.94
-};
 
 const THEMES: Record<ThemeId, ThemeDefinition> = {
   neon: {
@@ -308,28 +262,16 @@ class FourPongScene extends Phaser.Scene {
   private players: PlayerState[] = [];
   private ball = new Phaser.Math.Vector2(0, 0);
   private velocity = new Phaser.Math.Vector2(0, 0);
-  private mode: GameMode = "menu";
+  // All gameplay state lives in the pure SimState (src/sim/physics.ts steps
+  // it). ball/velocity/players above are shared into it BY REFERENCE — Phaser
+  // Vector2 satisfies Vec2 structurally — so render code and the sim always
+  // see the same objects. Built in create() once the players exist.
+  private sim!: SimState;
+  private rng: () => number = Math.random;
   private message = "Circular 4 Player is ready.";
-  private botFill = true;
-  private botDifficulty: BotDifficulty = "medium";
-  private gameVariant: GameVariant = "classic";
   private themeId: ThemeId = "neon";
-  private triangleMotionMode: TriangleMotionMode = "steady";
   private musicVolume = 0.58;
   private sfxVolume = 0.82;
-  private triangleRotation = -Math.PI / 2;
-  private triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
-  private elapsed = 0;
-  private lastScoreAt = 0;
-  private triangleCollisionDisabledUntil = 0;
-  private roundNumber = 0;
-  private roundResolving = false;
-  private lastTouchType: TouchType = "none";
-  private lastTouchPlayerId?: number;
-  private caughtByPlayerId?: number;
-  private caughtAt = 0;
-  private caughtLaunchSpeed = 0;
-  private roundReadyAt = 0;
   private paddleImpactBursts: PaddleImpactBurst[] = [];
   private ballTrail: BallTrailPoint[] = [];
   private confettiParticles: ConfettiParticle[] = [];
@@ -344,6 +286,52 @@ class FourPongScene extends Phaser.Scene {
 
   constructor() {
     super("four-pong");
+  }
+
+  // Thin accessors over sim-owned state so scene/render/UI code keeps reading
+  // a single source of truth without sprinkling `this.sim.` everywhere.
+  private get mode(): GameMode {
+    return this.sim.mode;
+  }
+
+  private set mode(value: GameMode) {
+    this.sim.mode = value;
+  }
+
+  private get elapsed(): number {
+    return this.sim.elapsed;
+  }
+
+  private get botFill(): boolean {
+    return this.sim.botFill;
+  }
+
+  private set botFill(value: boolean) {
+    this.sim.botFill = value;
+  }
+
+  private get botDifficulty(): BotDifficulty {
+    return this.sim.botDifficulty;
+  }
+
+  private set botDifficulty(value: BotDifficulty) {
+    this.sim.botDifficulty = value;
+  }
+
+  private get gameVariant(): GameVariant {
+    return this.sim.gameVariant;
+  }
+
+  private set gameVariant(value: GameVariant) {
+    this.sim.gameVariant = value;
+  }
+
+  private get triangleMotionMode(): TriangleMotionMode {
+    return this.sim.triangleMotionMode;
+  }
+
+  private set triangleMotionMode(value: TriangleMotionMode) {
+    this.sim.triangleMotionMode = value;
   }
 
   preload() {
@@ -404,10 +392,11 @@ class FourPongScene extends Phaser.Scene {
       this.createPlayer(3, "P3", 0xf8d66d, "#f8d66d"),
       this.createPlayer(4, "P4", 0x69db7c, "#69db7c")
     ];
+    this.sim = createSimState({ players: this.players, ball: this.ball, velocity: this.velocity });
     this.applyPlayerTheme();
 
     this.scale.on("resize", this.handleResize, this);
-    this.rebuildArcs();
+    rebuildArcs(this.arena(), this.players);
     this.resetRound(undefined, false);
     this.emitHud();
   }
@@ -429,7 +418,7 @@ class FourPongScene extends Phaser.Scene {
 
   update(_time: number, delta: number) {
     const dt = Math.min(delta / 1000, 0.034);
-    this.elapsed += delta;
+    this.sim.elapsed += delta;
 
     if (Phaser.Input.Keyboard.JustDown(this.keys.reset)) {
       this.restartMatch();
@@ -439,27 +428,26 @@ class FourPongScene extends Phaser.Scene {
       this.toggleBotFill();
     }
 
-    this.updateTriangleMotion(dt);
+    stepTriangleMotion(this.sim, dt);
     this.updateBallTrail();
     this.updateConfetti(dt);
     this.updateMusic();
 
     if (this.mode === "playing") {
-      this.updateArenaRotation(dt);
-      this.updatePaddles(dt);
-      if (this.caughtByPlayerId !== undefined) {
-        this.updateCaughtBall();
-        if (!this.keys.pause.isDown || this.elapsed - this.caughtAt >= CATCH_DURATION) {
-          this.launchCaughtBall();
-        }
-      } else if (this.elapsed < this.roundReadyAt) {
+      const arena = this.arena();
+      const input = this.readLocalInput();
+      updateArenaRotation(this.sim, arena, dt);
+      stepPaddles(this.sim, arena, input, dt);
+      if (this.sim.caughtByPlayerId !== undefined) {
+        this.applySimEvents(stepCaughtBall(this.sim, arena, input.catchHeld));
+      } else if (this.sim.elapsed < this.sim.roundReadyAt) {
         // Give players a readable beat before the serve starts moving.
       } else {
-        this.applyTriangleGravity(dt, 275, MAX_BALL_SPEED);
-        this.advanceBall(dt);
+        applyTriangleGravity(this.sim, arena, dt, 275, MAX_BALL_SPEED);
+        this.applySimEvents(advanceBall(this.sim, arena, dt, input.catchHeld, this.rng));
       }
     } else if (this.mode === "menu") {
-      this.previewMenuMotion(dt);
+      this.applySimEvents(stepMenuPreview(this.sim, this.arena(), dt));
     }
 
     this.renderArena();
@@ -504,498 +492,117 @@ class FourPongScene extends Phaser.Scene {
       player.paddleAssistMultiplier = 1;
     }
 
-    this.roundNumber = 0;
-    this.clearTouchState();
-    this.clearCatchState();
-    this.roundResolving = false;
+    this.sim.roundNumber = 0;
+    clearTouchState(this.sim);
+    clearCatchState(this.sim);
+    this.sim.roundResolving = false;
     this.confettiParticles = [];
     this.mode = "playing";
     this.message = message;
-    this.rebuildArcs();
+    rebuildArcs(this.arena(), this.players);
     this.resetRound();
     this.emitHud();
   }
 
-  private updatePaddles(dt: number) {
-    const action = this.readLocalAction();
-    const human = this.players.find((player) => player.humanControlled && !player.eliminated);
-    const speed = BASE_PADDLE_SPEED * this.paddleSpeedMultiplier() * this.variantPaddleSpeedMultiplier();
-    const humanMoving = action.counterclockwise || action.clockwise;
-
-    if (human) {
-      this.updatePaddleAssist(human, dt, humanMoving);
-    }
-
-    if (human && humanMoving) {
-      const direction = (action.clockwise ? 1 : 0) - (action.counterclockwise ? 1 : 0);
-      human.paddleAngle += direction * speed * human.paddleAssistMultiplier * dt;
-      human.lastHumanInputAt = this.elapsed;
-      this.clampPaddleToArc(human);
-    }
-
-    if (!this.botFill) {
-      return;
-    }
-
-    const targetAngle = normalizeAngle(Math.atan2(this.ball.y - this.arena().center.y, this.ball.x - this.arena().center.x));
-    const botSpeed = speed * BOT_DIFFICULTY_SPEED[this.botDifficulty];
-    for (const player of this.players) {
-      if (player.eliminated || player.humanControlled) {
-        continue;
-      }
-
-      const target = clampAngleToArc(targetAngle, player.arcStart, player.arcEnd, this.paddleSafetyMargin(player));
-      const delta = shortestAngleDelta(player.paddleAngle, target);
-      player.paddleAngle = normalizeAngle(player.paddleAngle + Phaser.Math.Clamp(delta, -botSpeed * dt, botSpeed * dt));
-      this.clampPaddleToArc(player);
-    }
-  }
-
-  private updatePaddleAssist(player: PlayerState, dt: number, moving: boolean) {
-    const arena = this.arena();
-    const distanceToPaddle = this.ball.distance(this.paddleCenter(arena, player));
-    const closeDistance = arena.radius * 0.42;
-    const farDistance = arena.radius;
-    const farFactor = Phaser.Math.Clamp((distanceToPaddle - closeDistance) / Math.max(farDistance - closeDistance, 1), 0, 1);
-    const target = moving ? 1 + PADDLE_MOVE_ASSIST * farFactor : 1;
-    const rate = target > player.paddleAssistMultiplier ? PADDLE_ASSIST_ACCELERATION : PADDLE_ASSIST_DECELERATION;
-    const smoothing = 1 - Math.exp(-rate * dt);
-    player.paddleAssistMultiplier = Phaser.Math.Linear(player.paddleAssistMultiplier, target, smoothing);
-  }
-
-  private readLocalAction(): InputAction {
+  private readLocalInput(): PlayerInput {
     return {
       counterclockwise: this.keys.counterclockwise.isDown,
-      clockwise: this.keys.clockwise.isDown
+      clockwise: this.keys.clockwise.isDown,
+      catchHeld: this.keys.pause.isDown
     };
   }
 
-  private handlePaddleCollisions(previousBall?: Phaser.Math.Vector2) {
-    const arena = this.arena();
-    for (const player of this.activePlayers()) {
-      const hit = this.paddleHitTest(arena, player, previousBall);
-      if (!hit) {
-        continue;
-      }
+  /**
+   * Maps SimEvents from the pure simulation (src/sim/physics.ts) onto scene
+   * side effects: particles, sound, status messages, HUD refreshes, and the
+   * delayed re-serve. Keeps rendering/audio out of the sim so it can run
+   * headless on a server later.
+   */
+  private applySimEvents(events: SimEvent[]) {
+    let hudDirty = false;
 
-      if (this.velocity.dot(hit.normal) >= 0 && !hit.crossed && hit.penetration <= 0) {
-        continue;
-      }
-
-      const tangent = new Phaser.Math.Vector2(-hit.radial.y, hit.radial.x);
-      const roundedNormal = hit.normal.clone().add(tangent.clone().scale(hit.offset * PADDLE_CURVE_RESPONSE)).normalize();
-      const repeatHit = this.lastTouchType === "player" && this.lastTouchPlayerId === player.id;
-
-      this.addCharge(player);
-      this.spawnPaddleImpactBurst(hit.contact, hit.radial, tangent);
-      this.playPaddleHitSound();
-
-      if (this.canCatchBall(player)) {
-        this.startCatch(player);
-        return;
-      }
-
-      if (this.velocity.dot(roundedNormal) < 0 || hit.crossed) {
-        this.reflectBall(roundedNormal);
-      }
-
-      if (repeatHit) {
-        this.boostBallSpeed(REPEAT_HIT_BOOST);
-        this.message = `${player.name} double-tapped the ball.`;
-      }
-      this.lastTouchType = "player";
-      this.lastTouchPlayerId = player.id;
-      this.ball.copy(hit.contact.add(roundedNormal.scale(BALL_RADIUS + PADDLE_RELEASE_GAP)));
-      this.trimBallTrail();
-      this.emitHud();
-      return;
-    }
-  }
-
-  private advanceBall(dt: number) {
-    const distance = this.velocity.length() * dt;
-    const steps = Math.max(1, Math.ceil(distance / (BALL_RADIUS * 0.65)));
-    const stepDt = dt / steps;
-
-    for (let index = 0; index < steps; index += 1) {
-      const previousBall = this.ball.clone();
-      this.ball.add(this.velocity.clone().scale(stepDt));
-      this.handleTriangleCollision();
-      this.handleArcBarrierCollisions(previousBall);
-      this.handlePaddleCollisions(previousBall);
-      this.handleGoals();
-
-      if (this.roundResolving || this.caughtByPlayerId !== undefined || this.mode !== "playing") {
-        return;
-      }
-    }
-  }
-
-  private paddleHitTest(arena: ArenaGeometry, player: PlayerState, previousBall?: Phaser.Math.Vector2): PaddleCollisionHit | undefined {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const segments = this.paddleCollisionSegments(arena, player);
-    let best:
-      | {
-        contact: Phaser.Math.Vector2;
-        distance: number;
-        offset: number;
-      }
-      | undefined;
-
-    for (const segment of segments) {
-      const contact = closestPointOnSegment(this.ball, segment.start, segment.end);
-      const distance = contact.distance(this.ball);
-      if (!best || distance < best.distance) {
-        best = { contact, distance, offset: segment.offset };
-      }
-    }
-
-    if (best && best.distance <= BALL_RADIUS) {
-      const normal = this.paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-      const separation = this.ball.clone().subtract(best.contact);
-      return {
-        contact: best.contact,
-        normal: separation.lengthSq() > 0.0001 ? separation.normalize() : normal,
-        radial,
-        offset: best.offset,
-        penetration: BALL_RADIUS - best.distance,
-        crossed: false
-      };
-    }
-
-    if (!previousBall) {
-      return undefined;
-    }
-
-    return this.paddleSweptHitTest(previousBall, arena, center, radial, tangent, segments);
-  }
-
-  private paddleSweptHitTest(
-    previousBall: Phaser.Math.Vector2,
-    arena: ArenaGeometry,
-    center: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    segments: PaddleSegment[]
-  ): PaddleCollisionHit | undefined {
-    const travel = this.ball.clone().subtract(previousBall);
-    if (travel.lengthSq() === 0) {
-      return undefined;
-    }
-
-    let best:
-      | {
-        contact: Phaser.Math.Vector2;
-        distance: number;
-        offset: number;
-      }
-      | undefined;
-
-    for (const segment of segments) {
-      const closest = closestPointsBetweenSegments(previousBall, this.ball, segment.start, segment.end);
-      if (closest.distance > BALL_RADIUS) {
-        continue;
-      }
-
-      if (!best || closest.distance < best.distance) {
-        best = {
-          contact: closest.b,
-          distance: closest.distance,
-          offset: segment.offset
-        };
-      }
-    }
-
-    if (!best) {
-      return undefined;
-    }
-
-    const separation = this.ball.clone().subtract(best.contact);
-    const normal = this.paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-
-    return {
-      contact: best.contact,
-      normal: separation.lengthSq() > 0.0001 ? separation.normalize() : normal,
-      radial,
-      offset: best.offset,
-      penetration: BALL_RADIUS - best.distance,
-      crossed: true
-    };
-  }
-
-  private paddleHitNormal(
-    arena: ArenaGeometry,
-    contact: Phaser.Math.Vector2,
-    offset: number,
-    center: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2
-  ) {
-    const halfHeight = this.paddleHalfHeight(arena);
-    const concaveHalfWidth = this.paddleConcaveHalfWidth(arena);
-    const local = contact.clone().subtract(center);
-    const localY = local.dot(radial);
-
-    if (localY > halfHeight * 0.5) {
-      return radial.clone();
-    }
-
-    const slope = this.paddleInnerSlope(Phaser.Math.Clamp(offset, -1, 1), concaveHalfWidth, halfHeight);
-    const curveNormal = tangent.clone().scale(slope).subtract(radial).normalize();
-    return curveNormal;
-  }
-
-  private paddleCollisionSegments(arena: ArenaGeometry, player: PlayerState): PaddleSegment[] {
-    const outline = this.paddleOutlinePoints(arena, player);
-    return outline.map((point, index) => {
-      const next = outline[(index + 1) % outline.length];
-      return {
-        start: point.position,
-        end: next.position,
-        offset: (point.offset + next.offset) / 2
-      };
-    });
-  }
-
-  private applyTriangleGravity(dt: number, minSpeed: number, maxSpeed: number) {
-    const arena = this.arena();
-    const towardTriangle = arena.center.clone().subtract(this.ball);
-    const distanceSq = Math.max(towardTriangle.lengthSq(), 1600);
-    const force = Math.min(48, TRIANGLE_GRAVITY / distanceSq);
-    this.velocity.add(towardTriangle.normalize().scale(force * dt));
-
-    const speed = this.velocity.length();
-    if (speed > 0) {
-      this.velocity.normalize().scale(Phaser.Math.Clamp(speed, minSpeed, maxSpeed));
-    }
-  }
-
-  private updateTriangleMotion(dt: number) {
-    if (this.triangleMotionMode === "steady") {
-      this.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
-    } else {
-      const sign = this.triangleAngularVelocity < 0 ? -1 : 1;
-      const damped = this.triangleAngularVelocity * Math.pow(TRIANGLE_REACTIVE_DAMPING, dt * 60);
-      this.triangleAngularVelocity = Math.abs(damped) < TRIANGLE_REACTIVE_MIN_SPEED
-        ? sign * TRIANGLE_REACTIVE_MIN_SPEED
-        : Phaser.Math.Clamp(damped, -TRIANGLE_REACTIVE_MAX_SPEED, TRIANGLE_REACTIVE_MAX_SPEED);
-    }
-
-    this.triangleRotation += this.triangleAngularVelocity * dt;
-  }
-
-  private handleTriangleCollision() {
-    const arena = this.arena();
-    const vertices = this.triangleVertices(arena);
-
-    if (pointInTriangle(this.ball, vertices[0], vertices[1], vertices[2])) {
-      this.triangleCollisionDisabledUntil = this.elapsed + TRIANGLE_PHASE_DELAY;
-      this.clearTouchState();
-      this.lastTouchType = "triangle";
-      return;
-    }
-
-    if (this.elapsed < this.triangleCollisionDisabledUntil) {
-      return;
-    }
-
-    for (let index = 0; index < vertices.length; index += 1) {
-      const start = vertices[index];
-      const end = vertices[(index + 1) % vertices.length];
-      const closest = closestPointOnSegment(this.ball, start, end);
-      const delta = this.ball.clone().subtract(closest);
-      const distance = delta.length();
-
-      if (distance >= BALL_RADIUS || distance === 0) {
-        continue;
-      }
-
-      const normal = delta.normalize();
-      this.applyTriangleReactiveImpulse(closest);
-      this.reflectBall(normal);
-      this.ball.copy(closest.add(normal.scale(BALL_RADIUS + 0.5)));
-      this.trimBallTrail();
-      this.clearTouchState();
-      this.lastTouchType = "triangle";
-      return;
-    }
-  }
-
-  private handleArcBarrierCollisions(previousBall?: Phaser.Math.Vector2) {
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-    const distance = fromCenter.length();
-    const barrierRadius = arena.radius - ARC_BARRIER_INSET;
-    const barrierHalfThickness = ARC_BARRIER_THICKNESS / 2;
-
-    if (distance < barrierRadius - barrierHalfThickness - BALL_RADIUS || distance > barrierRadius + barrierHalfThickness + BALL_RADIUS) {
-      return;
-    }
-
-    const angle = normalizeAngle(Math.atan2(fromCenter.y, fromCenter.x));
-    for (const barrierAngle of this.arcBarrierAngles()) {
-      if (Math.abs(shortestAngleDelta(barrierAngle, angle)) > ARC_BARRIER_HALF_ANGLE) {
-        continue;
-      }
-
-      const contact = pointOnCircle(arena.center, barrierAngle, barrierRadius);
-      const normal = fromCenter.lengthSq() > 0 ? fromCenter.normalize() : contact.clone().subtract(arena.center).normalize();
-      const movingAcross = previousBall ? previousBall.distance(this.ball) > 0 : false;
-      if (this.velocity.dot(normal) > 0 && !movingAcross) {
-        continue;
-      }
-
-      this.reflectBall(normal);
-      this.ball.copy(contact.add(normal.scale(BALL_RADIUS + barrierHalfThickness + 0.5)));
-      this.trimBallTrail();
-      return;
-    }
-  }
-
-  private applyTriangleReactiveImpulse(contact: Phaser.Math.Vector2) {
-    if (this.triangleMotionMode !== "reactive") {
-      return;
-    }
-
-    const arena = this.arena();
-    const lever = contact.clone().subtract(arena.center);
-    const incoming = this.velocity.clone();
-    const tangentPush = lever.x * incoming.y - lever.y * incoming.x;
-    const speedFactor = Phaser.Math.Clamp(incoming.length() / MAX_BALL_SPEED, 0.28, 1.35);
-    const direction = Math.sign(tangentPush) || Math.sign(this.triangleAngularVelocity) || 1;
-    const impulse = direction * Phaser.Math.Clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.22, 1.18) * speedFactor * 2.2;
-    this.triangleAngularVelocity = Phaser.Math.Clamp(
-      this.triangleAngularVelocity + impulse,
-      -TRIANGLE_REACTIVE_MAX_SPEED,
-      TRIANGLE_REACTIVE_MAX_SPEED
-    );
-  }
-
-  private handleGoals() {
-    if (this.roundResolving) {
-      return;
-    }
-
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-
-    if (fromCenter.length() <= arena.radius + BALL_RADIUS || this.elapsed - this.lastScoreAt < 350) {
-      return;
-    }
-
-    this.roundResolving = true;
-    this.clearTouchState();
-    this.clearCatchState();
-
-    const scorer = this.playerForAngle(normalizeAngle(Math.atan2(fromCenter.y, fromCenter.x)));
-    if (!scorer) {
-      this.resetRound();
-      return;
-    }
-
-    this.lastScoreAt = this.elapsed;
-    scorer.shields -= 1;
-    scorer.eliminated = scorer.shields <= 0;
-
-    if (scorer.eliminated) {
-      this.message = `${scorer.name} is out. The circle closes.`;
-      this.rebuildArcs();
-    } else {
-      this.message = `${scorer.name} cracked. ${scorer.shields} shields remain.`;
-    }
-
-    const remaining = this.activePlayers();
-    if (remaining.length <= 1) {
-      const winner = remaining[0];
-      this.message = `${winner?.name ?? "No one"} wins!`;
-      this.mode = "matchOver";
-      this.playWinFanfare();
-      this.spawnWinConfetti(winner);
-    } else {
-      this.time.delayedCall(420, () => {
-        if (this.mode === "playing") {
-          this.resetRound(scorer.paddleAngle);
+    for (const event of events) {
+      switch (event.kind) {
+        case "paddleHit": {
+          this.spawnPaddleImpactBurst(event.contact, event.radial, event.tangent, event.tangentSign);
+          this.playPaddleHitSound();
+          if (!event.caught) {
+            if (event.repeatHit) {
+              const player = this.playerById(event.playerId);
+              if (player) {
+                this.message = `${player.name} double-tapped the ball.`;
+              }
+            }
+            this.trimBallTrail();
+          }
+          hudDirty = true;
+          break;
         }
-      });
+        case "catchStart": {
+          const player = this.playerById(event.playerId);
+          if (player) {
+            this.message = `${player.name} caught the ball. Release Space to fire.`;
+          }
+          hudDirty = true;
+          break;
+        }
+        case "catchLaunch": {
+          const player = this.playerById(event.playerId);
+          if (player) {
+            this.message = `${player.name} fired the charged shot.`;
+          }
+          hudDirty = true;
+          break;
+        }
+        case "triangleHit":
+        case "barrierHit": {
+          this.trimBallTrail();
+          break;
+        }
+        case "goal": {
+          const scorer = this.playerById(event.scorerId);
+          if (scorer) {
+            this.message = event.eliminated
+              ? `${scorer.name} is out. The circle closes.`
+              : `${scorer.name} cracked. ${event.shieldsRemaining} shields remain.`;
+          }
+          // Sim left mode === "playing" → match continues; schedule the
+          // re-serve (sim itself never owns timers).
+          if (this.mode === "playing" && scorer) {
+            this.time.delayedCall(420, () => {
+              if (this.mode === "playing") {
+                this.resetRound(scorer.paddleAngle);
+              }
+            });
+          }
+          hudDirty = true;
+          break;
+        }
+        case "matchOver": {
+          const winner = event.winnerId === undefined ? undefined : this.playerById(event.winnerId);
+          this.message = `${winner?.name ?? "No one"} wins!`;
+          this.playWinFanfare();
+          this.spawnWinConfetti(winner);
+          hudDirty = true;
+          break;
+        }
+        case "serve": {
+          this.serveIndicatorDirection.set(event.direction.x, event.direction.y);
+          this.serveIndicatorUntil = this.mode === "playing" ? this.elapsed + SERVE_INDICATOR_LIFETIME : 0;
+          this.paddleImpactBursts = [];
+          this.ballTrail = [];
+          break;
+        }
+      }
     }
 
-    this.emitHud();
-  }
-
-  private reflectBall(normal: Phaser.Math.Vector2) {
-    const speed = Math.min(this.velocity.length() * 1.02, MAX_BALL_SPEED);
-    const reflected = this.velocity.clone().subtract(normal.clone().scale(2 * this.velocity.dot(normal)));
-    this.velocity.copy(reflected.normalize().scale(speed));
-  }
-
-  private boostBallSpeed(multiplier: number) {
-    const speed = this.velocity.length();
-    if (speed > 0) {
-      this.velocity.normalize().scale(Math.min(speed * multiplier, MAX_BALL_SPEED));
+    if (hudDirty) {
+      this.emitHud();
     }
   }
 
-  private addCharge(player: PlayerState) {
-    player.charge = Math.min(MAX_CHARGE, player.charge + 1);
-  }
-
-  private canCatchBall(player: PlayerState) {
-    return player.humanControlled && player.charge >= MAX_CHARGE && this.keys.pause.isDown;
-  }
-
-  private startCatch(player: PlayerState) {
-    this.caughtByPlayerId = player.id;
-    this.caughtAt = this.elapsed;
-    this.caughtLaunchSpeed = Math.max(this.velocity.length(), 360);
-    this.velocity.set(0, 0);
-    this.updateCaughtBall();
-    this.lastTouchType = "player";
-    this.lastTouchPlayerId = player.id;
-    this.message = `${player.name} caught the ball. Release Space to fire.`;
-    this.emitHud();
-  }
-
-  private updateCaughtBall() {
-    const player = this.players.find((entry) => entry.id === this.caughtByPlayerId && !entry.eliminated);
-    if (!player) {
-      this.clearCatchState();
-      return;
-    }
-
-    this.ball.copy(this.paddleCatchPoint(this.arena(), player));
-  }
-
-  private launchCaughtBall() {
-    const player = this.players.find((entry) => entry.id === this.caughtByPlayerId && !entry.eliminated);
-    if (!player) {
-      this.clearCatchState();
-      return;
-    }
-
-    const arena = this.arena();
-    const radial = this.paddleCenter(arena, player).subtract(arena.center).normalize();
-    const launchSpeed = Math.min(Math.max(BASE_BALL_SPEED, this.caughtLaunchSpeed) * CATCH_LAUNCH_BOOST, MAX_CHARGED_BALL_SPEED);
-    this.ball.copy(this.paddleCatchPoint(arena, player));
-    this.velocity.copy(radial.scale(-launchSpeed));
-    player.charge = 0;
-    this.lastTouchType = "player";
-    this.lastTouchPlayerId = player.id;
-    this.clearCatchState();
-    this.message = `${player.name} fired the charged shot.`;
-    this.emitHud();
-  }
-
-  private clearCatchState() {
-    this.caughtByPlayerId = undefined;
-    this.caughtAt = 0;
-    this.caughtLaunchSpeed = 0;
-  }
-
-  private clearTouchState() {
-    this.lastTouchType = "none";
-    this.lastTouchPlayerId = undefined;
+  private playerById(id: number) {
+    return this.players.find((player) => player.id === id);
   }
 
   private renderArena() {
@@ -1041,7 +648,7 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private drawTriangle(arena: ArenaGeometry, theme: ThemeDefinition) {
-    const vertices = this.triangleVertices(arena);
+    const vertices = triangleVertices(arena, this.sim.triangleRotation);
     this.gfx.fillStyle(theme.triangleFill, 1);
     this.gfx.lineStyle(2, theme.triangleStroke, 0.62);
     this.gfx.beginPath();
@@ -1076,7 +683,7 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private traceConcavePaddle(arena: ArenaGeometry, player: PlayerState) {
-    const outline = this.paddleOutlinePoints(arena, player);
+    const outline = paddleOutlinePoints(arena, player);
     outline.forEach((point, index) => {
       if (index === 0) {
         this.gfx.moveTo(point.position.x, point.position.y);
@@ -1084,114 +691,6 @@ class FourPongScene extends Phaser.Scene {
         this.gfx.lineTo(point.position.x, point.position.y);
       }
     });
-  }
-
-  private paddleOutlinePoints(arena: ArenaGeometry, player: PlayerState) {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const concaveHalfWidth = this.paddleConcaveHalfWidth(arena);
-    const halfWidth = this.paddleHalfWidth(arena);
-    const halfHeight = this.paddleHalfHeight(arena);
-    const steps = 18;
-    const points: Array<{ position: Phaser.Math.Vector2; offset: number }> = [];
-
-    points.push({
-      position: this.paddleOuterPoint(arena, player, -halfWidth),
-      offset: -1
-    });
-
-    for (let index = 0; index <= steps; index += 1) {
-      const offset = -1 + index / steps * 2;
-      points.push({
-        position: this.paddleOuterPoint(arena, player, offset * concaveHalfWidth),
-        offset
-      });
-    }
-
-    points.push({
-      position: this.paddleOuterPoint(arena, player, halfWidth),
-      offset: 1
-    });
-    points.push({
-      position: this.paddleLocalPoint(center, tangent, radial, halfWidth, this.paddleInnerY(1, halfHeight)),
-      offset: 1
-    });
-
-    for (let index = steps; index >= 0; index -= 1) {
-      const offset = -1 + index / steps * 2;
-      points.push({
-        position: this.paddleLocalPoint(center, tangent, radial, offset * concaveHalfWidth, this.paddleInnerY(offset, halfHeight)),
-        offset
-      });
-    }
-
-    points.push({
-      position: this.paddleLocalPoint(center, tangent, radial, -halfWidth, this.paddleInnerY(-1, halfHeight)),
-      offset: -1
-    });
-
-    return points;
-  }
-
-  private paddleOuterPoint(arena: ArenaGeometry, player: PlayerState, localX: number) {
-    return pointOnCircle(arena.center, player.paddleAngle + localX / arena.radius, arena.radius);
-  }
-
-  private paddleCenter(arena: ArenaGeometry, player: PlayerState) {
-    return pointOnCircle(arena.center, player.paddleAngle, arena.radius - this.paddleHalfHeight(arena));
-  }
-
-  private paddleCatchPoint(arena: ArenaGeometry, player: PlayerState) {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const innerY = this.paddleInnerY(0, this.paddleHalfHeight(arena));
-    return this.paddleLocalPoint(center, tangent, radial, 0, innerY - BALL_RADIUS - PADDLE_RELEASE_GAP);
-  }
-
-  private paddleHalfWidth(arena: ArenaGeometry) {
-    return this.paddleConcaveHalfWidth(arena) + this.paddleWingLength(arena);
-  }
-
-  private paddleConcaveHalfWidth(arena: ArenaGeometry) {
-    return Math.max(37, arena.radius * arena.paddleAngleSpan * 0.54);
-  }
-
-  private paddleWingLength(arena: ArenaGeometry) {
-    return Math.max(PADDLE_WING_LENGTH_MIN, arena.radius * PADDLE_WING_LENGTH_RATIO);
-  }
-
-  private paddleHalfHeight(arena: ArenaGeometry) {
-    return Math.max(14, arena.paddleThickness * 0.74);
-  }
-
-  private paddleInnerY(offset: number, halfHeight: number) {
-    const endDip = halfHeight * 0.12;
-    return -halfHeight + halfHeight * PADDLE_CONCAVITY * (1 - offset * offset) - endDip * offset * offset;
-  }
-
-  private paddleInnerSlope(offset: number, halfWidth: number, halfHeight: number) {
-    return (-2 * halfHeight * (PADDLE_CONCAVITY + 0.12) * offset) / halfWidth;
-  }
-
-  private paddleLocalPoint(
-    center: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2,
-    x: number,
-    y: number
-  ) {
-    return center.clone().add(tangent.clone().scale(x)).add(radial.clone().scale(y));
-  }
-
-  private paddleSpeedMultiplier() {
-    const completedRounds = Math.max(0, this.roundNumber - 1);
-    return Math.min(MAX_PADDLE_SPEED_MULTIPLIER, 1 + completedRounds * PADDLE_SPEED_RAMP);
-  }
-
-  private variantPaddleSpeedMultiplier() {
-    return this.gameVariant === "rotating" ? ROTATING_VARIANT_PADDLE_SPEED_BOOST : 1;
   }
 
   private drawBall(theme: ThemeDefinition) {
@@ -1255,14 +754,13 @@ class FourPongScene extends Phaser.Scene {
     }];
   }
 
-  private spawnPaddleImpactBurst(contact: Phaser.Math.Vector2, radial: Phaser.Math.Vector2, tangent: Phaser.Math.Vector2) {
-    const tangentDrift = this.velocity.dot(tangent);
-    const tangentSign = tangentDrift === 0 ? 1 : -Math.sign(tangentDrift);
-
+  // tangentSign arrives with the SimEvent (it depends on the pre-reflection
+  // ball velocity, which is gone by the time the scene processes events).
+  private spawnPaddleImpactBurst(contact: Vec2, radial: Vec2, tangent: Vec2, tangentSign: number) {
     this.paddleImpactBursts.push({
-      position: contact.clone(),
-      radial: radial.clone().normalize(),
-      tangent: tangent.clone().normalize(),
+      position: new Phaser.Math.Vector2(contact.x, contact.y),
+      radial: new Phaser.Math.Vector2(radial.x, radial.y).normalize(),
+      tangent: new Phaser.Math.Vector2(tangent.x, tangent.y).normalize(),
       tangentSign,
       createdAt: this.elapsed
     });
@@ -1342,7 +840,7 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private currentMusicTrack() {
-    if (this.roundNumber <= 0 || this.mode !== "playing") {
+    if (this.sim.roundNumber <= 0 || this.mode !== "playing") {
       return undefined;
     }
 
@@ -1462,67 +960,13 @@ class FourPongScene extends Phaser.Scene {
     }
   }
 
-  private rebuildArcs() {
-    const active = this.activePlayers();
-    const span = TAU / Math.max(active.length, 1);
-    const startOffset = -Math.PI / 2 - span / 2;
-
-    active.forEach((player, index) => {
-      player.arcStart = normalizeAngle(startOffset + index * span);
-      player.arcEnd = player.arcStart + span;
-      player.paddleAngle = normalizeAngle(player.arcStart + span / 2);
-      this.clampPaddleToArc(player);
-    });
-  }
-
-  private updateArenaRotation(dt: number) {
-    if (this.gameVariant !== "rotating") {
-      return;
-    }
-
-    const rotation = ARENA_ROTATION_SPEED * dt;
-    for (const player of this.activePlayers()) {
-      player.arcStart += rotation;
-      player.arcEnd += rotation;
-      player.paddleAngle = normalizeAngle(player.paddleAngle + rotation);
-      this.clampPaddleToArc(player);
-    }
-  }
-
+  /**
+   * Thin wrapper over the sim's resetRound: runs the pure serve math, then
+   * routes the resulting "serve" event through applySimEvents (which sets the
+   * serve indicator and clears trails/bursts, like the old method did).
+   */
   private resetRound(targetAngle?: number, countRound = true) {
-    const arena = this.arena();
-    const angle = normalizeAngle((targetAngle ?? Phaser.Math.FloatBetween(0, TAU)) + Phaser.Math.FloatBetween(-0.32, 0.32));
-    const speed = this.mode === "menu" ? MENU_BALL_SPEED : BASE_BALL_SPEED;
-
-    if (countRound && this.mode === "playing") {
-      this.roundNumber += 1;
-    }
-
-    this.ball.copy(arena.center);
-    this.velocity.set(Math.cos(angle) * speed, Math.sin(angle) * speed);
-    this.serveIndicatorDirection.copy(this.velocity.clone().normalize());
-    this.serveIndicatorUntil = this.mode === "playing" ? this.elapsed + SERVE_INDICATOR_LIFETIME : 0;
-    this.triangleCollisionDisabledUntil = this.elapsed + TRIANGLE_PHASE_DELAY;
-    this.roundReadyAt = this.mode === "playing" ? this.elapsed + SPAWN_DELAY : 0;
-    this.roundResolving = false;
-    this.clearTouchState();
-    this.clearCatchState();
-    this.paddleImpactBursts = [];
-    this.ballTrail = [];
-  }
-
-  private previewMenuMotion(dt: number) {
-    this.applyTriangleGravity(dt, 150, 260);
-    this.ball.add(this.velocity.clone().scale(dt));
-    this.handleTriangleCollision();
-
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-    if (fromCenter.length() > arena.radius * 0.72) {
-      const normal = fromCenter.normalize();
-      this.reflectBall(normal);
-      this.ball.copy(arena.center.clone().add(normal.scale(arena.radius * 0.72)));
-    }
+    this.applySimEvents(simResetRound(this.sim, this.arena(), this.rng, targetAngle, countRound));
   }
 
   public togglePause() {
@@ -1545,7 +989,7 @@ class FourPongScene extends Phaser.Scene {
    * this to re-serve if that happened.
    */
   private resumeRoundIfStalled() {
-    if (this.roundResolving) {
+    if (this.sim.roundResolving) {
       this.resetRound();
     }
   }
@@ -1578,7 +1022,7 @@ class FourPongScene extends Phaser.Scene {
   private setTriangleMotionMode(mode: TriangleMotionMode) {
     this.triangleMotionMode = mode;
     if (mode === "steady") {
-      this.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
+      this.sim.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
     }
     this.message = mode === "steady" ? "Triangle motion set to steady spin." : "Triangle motion set to reactive hits.";
     this.emitHud();
@@ -1601,42 +1045,12 @@ class FourPongScene extends Phaser.Scene {
     return computeArena(this.scale.width || 960, this.scale.height || 640);
   }
 
-  private triangleVertices(arena: ArenaGeometry) {
-    return [0, 1, 2].map((index) => pointOnCircle(arena.center, this.triangleRotation + index * TAU / 3, arena.triangleRadius));
-  }
-
-  private playerForAngle(angle: number) {
-    return this.activePlayers().find((player) => angleInArc(angle, player.arcStart, player.arcEnd));
-  }
-
   private activePlayers() {
     return this.players.filter((player) => !player.eliminated);
   }
 
   private lastTouchPlayer() {
-    return this.players.find((player) => player.id === this.lastTouchPlayerId);
-  }
-
-  private arcBarrierAngles() {
-    const active = this.activePlayers();
-    const angles: number[] = [];
-    for (const player of active) {
-      if (!angles.some((angle) => Math.abs(shortestAngleDelta(angle, player.arcStart)) < 0.001)) {
-        angles.push(normalizeAngle(player.arcStart));
-      }
-    }
-    return angles;
-  }
-
-  private clampPaddleToArc(player: PlayerState) {
-    player.paddleAngle = clampAngleToArc(player.paddleAngle, player.arcStart, player.arcEnd, this.paddleSafetyMargin(player));
-  }
-
-  private paddleSafetyMargin(player: PlayerState) {
-    const arena = this.arena();
-    const span = player.arcEnd - player.arcStart;
-    const halfPaddleAngle = this.paddleHalfWidth(arena) / arena.radius + 0.01;
-    return Math.min(span * 0.46, Math.max(0.04, halfPaddleAngle));
+    return this.players.find((player) => player.id === this.sim.lastTouchPlayerId);
   }
 
   private handleResize(
@@ -1646,8 +1060,8 @@ class FourPongScene extends Phaser.Scene {
     previousWidth: number,
     previousHeight: number
   ) {
-    if (this.caughtByPlayerId !== undefined) {
-      this.updateCaughtBall();
+    if (this.sim.caughtByPlayerId !== undefined) {
+      updateCaughtBall(this.sim, this.arena());
       return;
     }
 
@@ -1655,8 +1069,11 @@ class FourPongScene extends Phaser.Scene {
     // devtools, and overlay reflows no longer reset the round mid-rally.
     const old = computeArena(previousWidth || gameSize.width, previousHeight || gameSize.height);
     const next = computeArena(gameSize.width, gameSize.height);
-    const offset = this.ball.clone().subtract(old.center).scale(next.radius / old.radius);
-    this.ball.copy(next.center.clone().add(offset));
+    const scale = next.radius / old.radius;
+    this.ball.set(
+      next.center.x + (this.ball.x - old.center.x) * scale,
+      next.center.y + (this.ball.y - old.center.y) * scale
+    );
     // Velocity magnitude is intentionally left unchanged; paddle angles are
     // radians and need no remap. Stale trail points would smear, so drop them.
     this.ballTrail = [];
@@ -1782,96 +1199,9 @@ class FourPongScene extends Phaser.Scene {
   }
 }
 
-/**
- * Pure arena layout: derives the play circle from a viewport size.
- * Kept free of scene state so resize remapping (and future netcode) can
- * compute geometry for arbitrary dimensions.
- */
-function computeArena(width: number, height: number): ArenaGeometry {
-  const hudSafeTop = width < 760 ? 142 : 92;
-  const controlsSafeBottom = width < 760 ? 118 : 70;
-  const centerY = hudSafeTop + (height - hudSafeTop - controlsSafeBottom) / 2;
-  const radius = Math.max(126, Math.min(width * 0.43, (height - hudSafeTop - controlsSafeBottom) * 0.48));
-
-  return {
-    center: new Phaser.Math.Vector2(width / 2, centerY),
-    radius,
-    paddleThickness: Math.max(16, Math.min(24, radius * 0.085)),
-    paddleAngleSpan: Math.max(0.252, Math.min(0.468, 68.4 / radius)),
-    triangleRadius: Math.max(32, Math.min(56, radius * 0.18))
-  };
-}
-
-function normalizeAngle(angle: number) {
-  return Phaser.Math.Wrap(angle, 0, TAU);
-}
-
-function angleInArc(angle: number, start: number, end: number) {
-  const normalized = normalizeAngle(angle);
-  const normalizedStart = normalizeAngle(start);
-  const span = end - start;
-  const relative = normalizeAngle(normalized - normalizedStart);
-  return relative <= span;
-}
-
-function clampAngleToArc(angle: number, start: number, end: number, margin: number) {
-  const normalizedStart = normalizeAngle(start);
-  const span = end - start;
-  const relative = normalizeAngle(normalizeAngle(angle) - normalizedStart);
-  const clamped = Phaser.Math.Clamp(relative, margin, Math.max(margin, span - margin));
-  return normalizeAngle(normalizedStart + clamped);
-}
-
-function shortestAngleDelta(from: number, to: number) {
-  return Phaser.Math.Angle.Wrap(to - from);
-}
-
-function pointOnCircle(center: Phaser.Math.Vector2, angle: number, radius: number) {
-  return new Phaser.Math.Vector2(
-    center.x + Math.cos(angle) * radius,
-    center.y + Math.sin(angle) * radius
-  );
-}
-
-function closestPointOnSegment(point: Phaser.Math.Vector2, start: Phaser.Math.Vector2, end: Phaser.Math.Vector2) {
-  const segment = end.clone().subtract(start);
-  const lengthSq = segment.lengthSq();
-  if (lengthSq === 0) {
-    return start.clone();
-  }
-
-  const t = Phaser.Math.Clamp(point.clone().subtract(start).dot(segment) / lengthSq, 0, 1);
-  return start.clone().add(segment.scale(t));
-}
-
-function closestPointsBetweenSegments(
-  aStart: Phaser.Math.Vector2,
-  aEnd: Phaser.Math.Vector2,
-  bStart: Phaser.Math.Vector2,
-  bEnd: Phaser.Math.Vector2
-) {
-  let bestA = aStart.clone();
-  let bestB = bStart.clone();
-  let bestDistance = Infinity;
-
-  const candidates = [
-    { a: aStart, b: closestPointOnSegment(aStart, bStart, bEnd) },
-    { a: aEnd, b: closestPointOnSegment(aEnd, bStart, bEnd) },
-    { a: closestPointOnSegment(bStart, aStart, aEnd), b: bStart },
-    { a: closestPointOnSegment(bEnd, aStart, aEnd), b: bEnd }
-  ];
-
-  for (const candidate of candidates) {
-    const distance = candidate.a.distance(candidate.b);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestA = candidate.a.clone();
-      bestB = candidate.b.clone();
-    }
-  }
-
-  return { a: bestA, b: bestB, distance: bestDistance };
-}
+// The simulation/geometry helper functions that used to live here moved to
+// src/sim/ (math.ts / geometry.ts / physics.ts / bot.ts) as pure modules.
+// Only render-side helpers remain below.
 
 function rotateVector(vector: Phaser.Math.Vector2, radians: number) {
   const cos = Math.cos(radians);
@@ -1880,19 +1210,6 @@ function rotateVector(vector: Phaser.Math.Vector2, radians: number) {
     vector.x * cos - vector.y * sin,
     vector.x * sin + vector.y * cos
   );
-}
-
-function pointInTriangle(point: Phaser.Math.Vector2, a: Phaser.Math.Vector2, b: Phaser.Math.Vector2, c: Phaser.Math.Vector2) {
-  const area = triangleSign(point, a, b);
-  const sideB = triangleSign(point, b, c);
-  const sideC = triangleSign(point, c, a);
-  const hasNegative = area < 0 || sideB < 0 || sideC < 0;
-  const hasPositive = area > 0 || sideB > 0 || sideC > 0;
-  return !(hasNegative && hasPositive);
-}
-
-function triangleSign(p1: Phaser.Math.Vector2, p2: Phaser.Math.Vector2, p3: Phaser.Math.Vector2) {
-  return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
 }
 
 const game = new Phaser.Game({
