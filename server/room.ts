@@ -1,5 +1,5 @@
 /**
- * Four Ponq — authoritative single-room game server (Stage 1).
+ * Four Ponq — authoritative single-room game server (Stage 2: session layer).
  *
  * ONE shared Room for v1: a single SimState built in the canonical net arena
  * (computeArena(960, 640)) so snap.ball.{x,y} land in the fixed coordinate frame
@@ -16,13 +16,26 @@
  * the identical movement/assist/clamp math.
  *
  * Pure sim modules (src/sim/*) are imported verbatim; no Phaser, no DOM.
+ *
+ * SESSION LAYER (Stage 2) — see shared/protocol.ts for the full flow. The Room
+ * tracks its own RoomMode ("lobby" | "countdown" | "playing" | "matchOver")
+ * ALONGSIDE the sim's GameMode: the sim only knows "menu"/"playing"/"matchOver";
+ * the ready screens and the 3-2-1 countdown are session-level states that the
+ * sim never sees. Connecting mid-match makes you a spectator (slot -1, still
+ * broadcast to); {t:"join"} seats you now (ready screen) or at the next serve
+ * (live match, FIFO queue, replacing a bot); matches start only when every
+ * seated human is ready, via a 3-2-1 countdown that any un-ready/disconnect
+ * cancels.
  */
 
 import {
+  COUNTDOWN_SECONDS,
   SIM_HZ,
   SNAP_HZ,
   MAX_PLAYERS,
   type PlayerView,
+  type PresenceInfo,
+  type RoomMode,
   type ServerMsg
 } from "../shared/protocol";
 import type {
@@ -89,6 +102,8 @@ interface Slot {
   input: StickyInput;
   /** sim-elapsed ms of the last human input (for parity with lastHumanInputAt). */
   lastHumanInputAt: number;
+  /** Ready-screen flag (lobby/matchOver/countdown). Always false for bots. */
+  ready: boolean;
 }
 
 /** What the WS layer needs to deliver a message to one connection. */
@@ -103,8 +118,8 @@ function freshInput(): StickyInput {
 
 /**
  * The single authoritative room. The WS server (server/index.ts) owns the set
- * of live Connections and forwards lifecycle calls (join/input/start/setBots/
- * leave) here; the Room owns ALL game state and the tick loop.
+ * of live Connections and forwards lifecycle calls (connect/input/requestSeat/
+ * ready/setBots/leave) here; the Room owns ALL game state and the tick loop.
  */
 export class Room {
   private readonly arena: ArenaGeometry;
@@ -121,6 +136,22 @@ export class Room {
   private reserveAt: number | null = null;
   /** Paddle angle to aim the pending re-serve toward (the scorer's angle). */
   private reserveAngle: number | undefined = undefined;
+
+  /**
+   * Session-layer mode (protocol RoomMode). Runs ALONGSIDE sim.mode, which
+   * stays a plain GameMode: "menu" while idling on a ready screen (so the sim
+   * never simulates a lobby), "playing"/"matchOver" while a match runs.
+   */
+  private roomMode: RoomMode = "lobby";
+  /** Which ready screen the running countdown started from (cancel target). */
+  private countdownFrom: "lobby" | "matchOver" = "lobby";
+  /** Seconds left in the countdown; only meaningful while mode "countdown". */
+  private countdownLeft = 0;
+  private countdownTimer: ReturnType<typeof setInterval> | null = null;
+  /** Spectators who asked to join mid-match (FIFO); seated at the next serve. */
+  private readonly pendingJoins: string[] = [];
+  /** hello names for ALL connections, so a spectator's name survives to seating. */
+  private readonly helloNames = new Map<string, string>();
 
   constructor() {
     this.arena = computeArena(NET_ARENA_WIDTH, NET_ARENA_HEIGHT);
@@ -146,7 +177,8 @@ export class Room {
       clientId: null,
       name: `P${i + 1}`,
       input: freshInput(),
-      lastHumanInputAt: -9999
+      lastHumanInputAt: -9999,
+      ready: false
     }));
 
     this.sim = createSimState({
@@ -154,9 +186,9 @@ export class Room {
       ball: { x: 0, y: 0 },
       velocity: { x: 0, y: 0 }
     });
-    // botFill defaults true (createSimState sets it); keep the lobby idle until a
-    // human starts a match. Mirror main.ts setup: split arcs, then a menu serve.
-    this.sim.mode = "lobby" as SimState["mode"];
+    // botFill defaults true (createSimState sets it); keep the lobby idle until
+    // a match starts. The sim idles in "menu"; the session mode is "lobby".
+    this.sim.mode = "menu";
     rebuildArcs(this.arena, this.players);
     // Seed a still ball at center so early snaps are finite before the first
     // start (no menu attract loop on the server — it would burn CPU for nobody).
@@ -169,22 +201,22 @@ export class Room {
   // --- connection lifecycle ------------------------------------------------
 
   /**
-   * Register a connection and assign the lowest free human slot. Returns the
-   * assigned slot (0..3) or -1 (spectator: all 4 slots are humans). Sends the
-   * {welcome} + {room} to this connection and broadcasts {room} to everyone.
+   * Register a connection ({t:"hello"}). On a ready screen (lobby/matchOver)
+   * the client is seated immediately in the lowest free slot; while a match is
+   * live (playing/countdown) — or when all 4 seats are taken — they become a
+   * SPECTATOR (slot -1): they stay in `conns` so they receive every room/snap
+   * broadcast, and can ask for a seat with {t:"join"}. Returns the slot.
    */
-  join(conn: Connection, name: string): number {
+  connect(conn: Connection, name: string): number {
     this.conns.set(conn.clientId, conn);
+    this.helloNames.set(conn.clientId, sanitizeName(name));
 
-    const slot = this.lowestFreeSlot();
-    if (slot >= 0) {
-      const s = this.slots[slot];
-      s.clientId = conn.clientId;
-      s.name = sanitizeName(name) || `P${slot + 1}`;
-      s.input = freshInput();
-      s.lastHumanInputAt = this.sim.elapsed;
-      this.players[slot].humanControlled = true;
-      this.players[slot].lastHumanInputAt = this.sim.elapsed;
+    let slot = -1;
+    if (this.roomMode === "lobby" || this.roomMode === "matchOver") {
+      slot = this.lowestFreeSlot();
+      if (slot >= 0) {
+        this.seat(conn.clientId, slot);
+      }
     }
 
     conn.send({
@@ -199,19 +231,113 @@ export class Room {
     return slot;
   }
 
-  /** Drop a connection; frees its slot (a bot takes over if botFill is on). */
+  /** Put a connected client into a slot (shared by connect/join/next-serve). */
+  private seat(clientId: string, slot: number): void {
+    const s = this.slots[slot];
+    s.clientId = clientId;
+    s.name = this.helloNames.get(clientId) || `P${slot + 1}`;
+    s.input = freshInput();
+    s.ready = false;
+    s.lastHumanInputAt = this.sim.elapsed;
+    this.players[slot].humanControlled = true;
+    this.players[slot].lastHumanInputAt = this.sim.elapsed;
+  }
+
+  /** Drop a connection; frees its seat (a bot takes over if botFill is on). */
   leave(clientId: string): void {
     this.conns.delete(clientId);
+    this.helloNames.delete(clientId);
+    const queued = this.pendingJoins.indexOf(clientId);
+    if (queued >= 0) {
+      this.pendingJoins.splice(queued, 1);
+    }
+
     const slot = this.slots.findIndex((s) => s.clientId === clientId);
     if (slot >= 0) {
       const s = this.slots[slot];
       s.clientId = null;
       s.name = `P${slot + 1}`;
       s.input = freshInput();
+      s.ready = false;
       this.players[slot].humanControlled = false;
+
+      // A seated human vanishing mid-countdown cancels it. If everyone still
+      // seated is ready, a FRESH 3-2-1 starts right away (no silent deadlock).
+      if (this.roomMode === "countdown") {
+        this.cancelCountdown();
+        this.maybeStartCountdown();
+      }
     }
-    this.broadcastRoom();
+
+    if (this.conns.size === 0) {
+      this.resetToEmptyLobby();
+    }
+    this.broadcastRoom(); // no-op when the room just emptied
     this.maybeIdle();
+  }
+
+  /**
+   * {t:"join"} — a spectator asks for a paddle ("Jump in?"). Ready screen:
+   * seated on the spot ({t:"seated"}). Live match (playing/countdown): queued
+   * FIFO and seated at the next serve boundary ({t:"joinPending"} now,
+   * {t:"seated"} then). Room already full (4 humans seated or promised a
+   * seat): {t:"error" roomFull}.
+   */
+  requestSeat(clientId: string): void {
+    const conn = this.conns.get(clientId);
+    if (!conn) {
+      return;
+    }
+    if (this.slots.some((s) => s.clientId === clientId)) {
+      conn.send({ t: "error", code: "notSpectator", message: "you already have a paddle" });
+      return;
+    }
+    if (this.seatedHumans() + this.pendingJoins.length >= MAX_PLAYERS) {
+      conn.send({ t: "error", code: "roomFull", message: "all four paddles are taken" });
+      return;
+    }
+
+    if (this.roomMode === "lobby" || this.roomMode === "matchOver") {
+      // The capacity check above guarantees a free slot here.
+      const slot = this.lowestFreeSlot();
+      this.seat(clientId, slot);
+      conn.send({ t: "seated", slot });
+      this.broadcastRoom();
+      return;
+    }
+
+    // playing / countdown — defer to the next serve (the resetRound boundary).
+    if (!this.pendingJoins.includes(clientId)) {
+      this.pendingJoins.push(clientId);
+    }
+    conn.send({ t: "joinPending", reason: "nextServe" });
+  }
+
+  /**
+   * Seat queued spectators (FIFO) into free slots, lowest slot first. Mid-match
+   * the slot must also be alive — an eliminated bot's seat can't be played, so
+   * those clients stay queued (the matchOver flush seats them). Each newly
+   * seated client gets {t:"seated"}; broadcasting {room} is the caller's job.
+   * Returns how many were seated.
+   */
+  private seatPendingJoins(): number {
+    const requireAlive = this.roomMode === "playing";
+    let seated = 0;
+    while (this.pendingJoins.length > 0) {
+      const slot = this.lowestFreeSlot(requireAlive);
+      if (slot < 0) {
+        break;
+      }
+      const clientId = this.pendingJoins.shift()!;
+      const conn = this.conns.get(clientId);
+      if (!conn) {
+        continue; // disconnected while queued (leave() should have removed it)
+      }
+      this.seat(clientId, slot);
+      conn.send({ t: "seated", slot });
+      seated += 1;
+    }
+    return seated;
   }
 
   /** Apply a human's sticky input to their slot. */
@@ -225,12 +351,97 @@ export class Room {
     s.lastHumanInputAt = this.sim.elapsed;
   }
 
-  /** Start/restart a match from lobby or matchOver (ignored mid-match). */
-  start(): void {
-    if (this.sim.mode === "playing") {
+  // --- ready system / countdown ---------------------------------------------
+
+  /**
+   * {t:"ready",on} on a ready screen ({t:"start"} is the legacy ready(true)).
+   * When EVERY seated human is ready (and there's at least one), the 3-2-1
+   * countdown runs; any un-ready during it cancels back to the screen it
+   * started from. Spectators and mid-match toggles are ignored — spectators
+   * never gate readiness.
+   */
+  ready(clientId: string, on: boolean): void {
+    const slot = this.slots.findIndex((s) => s.clientId === clientId);
+    if (slot < 0 || this.roomMode === "playing") {
       return;
     }
-    // Full reset to a fresh match, mirroring main.ts restartMatch().
+    this.slots[slot].ready = !!on;
+    if (!on) {
+      this.cancelCountdown();
+    }
+    this.broadcastRoom();
+    if (on) {
+      this.maybeStartCountdown();
+    }
+  }
+
+  /** Begin the 3-2-1 when ALL seated humans (>= 1) are ready on a ready screen. */
+  private maybeStartCountdown(): void {
+    if (this.roomMode !== "lobby" && this.roomMode !== "matchOver") {
+      return;
+    }
+    const seated = this.slots.filter((s) => s.clientId !== null);
+    if (seated.length === 0 || !seated.every((s) => s.ready)) {
+      return;
+    }
+    this.countdownFrom = this.roomMode;
+    this.roomMode = "countdown";
+    this.countdownLeft = COUNTDOWN_SECONDS;
+    this.broadcastRoom();
+    this.broadcastEvent("countdownTick", { n: this.countdownLeft });
+    this.countdownTimer = setInterval(() => this.stepCountdown(), 1000);
+  }
+
+  /** One 1s countdown beat: 3 → 2 → 1 → match start. */
+  private stepCountdown(): void {
+    this.countdownLeft -= 1;
+    if (this.countdownLeft <= 0) {
+      this.clearCountdownTimer();
+      this.beginMatch();
+      return;
+    }
+    this.broadcastRoom();
+    this.broadcastEvent("countdownTick", { n: this.countdownLeft });
+  }
+
+  /** Stop a running countdown and fall back to the ready screen it came from. */
+  private cancelCountdown(): void {
+    if (this.roomMode !== "countdown") {
+      return;
+    }
+    this.clearCountdownTimer();
+    this.roomMode = this.countdownFrom;
+  }
+
+  private clearCountdownTimer(): void {
+    if (this.countdownTimer) {
+      clearInterval(this.countdownTimer);
+      this.countdownTimer = null;
+    }
+  }
+
+  /**
+   * Countdown finished — full reset to a fresh match, mirroring main.ts
+   * restartMatch(). Match start IS a serve boundary, so spectators queued
+   * during the countdown are seated before the opening serve.
+   */
+  private beginMatch(): void {
+    for (const s of this.slots) {
+      s.ready = false;
+    }
+    this.resetMatchState();
+    this.sim.mode = "playing";
+    this.roomMode = "playing";
+    this.seatPendingJoins();
+    // Serve immediately; resetRound() with mode "playing" bumps roundNumber and
+    // emits a "serve" event we forward to clients.
+    this.dispatch(resetRound(this.sim, this.arena, this.rng));
+    this.broadcastRoom();
+    this.ensureLoop();
+  }
+
+  /** Reset players + per-round sim fields to a fresh-match baseline. */
+  private resetMatchState(): void {
     for (const p of this.players) {
       p.shields = MAX_SHIELDS;
       p.eliminated = false;
@@ -245,13 +456,25 @@ export class Room {
     this.sim.caughtByPlayerId = undefined;
     this.reserveAt = null;
     this.reserveAngle = undefined;
-    this.sim.mode = "playing";
     rebuildArcs(this.arena, this.players);
-    // Serve immediately; resetRound() with mode "playing" bumps roundNumber and
-    // emits a "serve" event we forward to clients.
-    this.dispatch(resetRound(this.sim, this.arena, this.rng));
-    this.broadcastRoom();
-    this.ensureLoop();
+  }
+
+  /**
+   * Everyone disconnected. Park the room as a fresh idle lobby so the next
+   * visitor gets a clean ready screen instead of spectating an abandoned
+   * bots-only match (and no timer burns CPU for nobody — Stage 1's idle
+   * guarantee, now keyed on connections instead of seats).
+   */
+  private resetToEmptyLobby(): void {
+    this.clearCountdownTimer();
+    this.pendingJoins.length = 0;
+    this.roomMode = "lobby";
+    this.sim.mode = "menu";
+    this.resetMatchState();
+    this.sim.ball.x = this.arena.center.x;
+    this.sim.ball.y = this.arena.center.y;
+    this.sim.velocity.x = 0;
+    this.sim.velocity.y = 0;
   }
 
   /** Toggle bot-fill for empty slots; echoes the new state via {room}. */
@@ -260,14 +483,36 @@ export class Room {
     this.broadcastRoom();
   }
 
+  /** Snapshot for GET /presence (the hub channel badge). Spectators are NOT
+   *  counted as humans; bots only count while they're actually driving paddles
+   *  in a live match. joinable = a seat is free now, or a bot seat exists that
+   *  a newcomer could take at the next serve (i.e. not 4 humans/promises). */
+  presence(): PresenceInfo {
+    const humans = this.seatedHumans();
+    return {
+      id: "four-ponq",
+      humans,
+      bots:
+        this.roomMode === "playing" && this.sim.botFill
+          ? MAX_PLAYERS - humans
+          : 0,
+      mode: this.roomMode,
+      joinable: humans + this.pendingJoins.length < MAX_PLAYERS
+    };
+  }
+
   // --- tick loop -----------------------------------------------------------
 
-  /** Start the fixed-step loop if a human is present and a match is playing. */
+  /**
+   * Start the fixed-step loop while a match is playing and ANYONE (seated
+   * human or spectator) is connected — spectators need live snapshots, and a
+   * bots-only match must keep advancing so queued joiners reach a serve.
+   */
   private ensureLoop(): void {
     if (this.timer) {
       return;
     }
-    if (!this.hasHuman() || this.sim.mode !== "playing") {
+    if (this.conns.size === 0 || this.sim.mode !== "playing") {
       return;
     }
     this.timer = setInterval(() => this.step(), Math.round(1000 / SIM_HZ));
@@ -275,7 +520,7 @@ export class Room {
 
   /** Stop the loop when nobody's connected (save CPU on the 2-core host). */
   private maybeIdle(): void {
-    if (!this.hasHuman() && this.timer) {
+    if (this.conns.size === 0 && this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
@@ -293,12 +538,17 @@ export class Room {
     stepTriangleMotion(this.sim, dt);
 
     if (this.sim.mode === "playing") {
-      // Fire a pending post-goal re-serve once its delay elapses.
+      // Fire a pending post-goal re-serve once its delay elapses. This is THE
+      // serve boundary: queued spectators take over bot slots just before it.
       if (this.reserveAt !== null && this.sim.elapsed >= this.reserveAt) {
         const angle = this.reserveAngle;
         this.reserveAt = null;
         this.reserveAngle = undefined;
+        const seated = this.seatPendingJoins();
         this.dispatch(resetRound(this.sim, this.arena, this.rng, angle));
+        if (seated > 0) {
+          this.broadcastRoom();
+        }
       }
 
       const input = this.aggregateCatch();
@@ -449,12 +699,23 @@ export class Room {
           }
           break;
         }
-        case "matchOver":
+        case "matchOver": {
           this.broadcastEvent("matchOver", { winnerId: event.winnerId });
           // Sim already set mode = "matchOver". Cancel any pending re-serve.
           this.reserveAt = null;
           this.reserveAngle = undefined;
+          // Session layer: land everyone on the post-match ready screen. The
+          // eliminated/shields state stays visible until the next countdown
+          // ends (beginMatch rebuilds it); ready flags reset; spectators still
+          // queued for "next serve" can be seated right now instead.
+          this.roomMode = "matchOver";
+          for (const s of this.slots) {
+            s.ready = false;
+          }
+          this.seatPendingJoins();
+          this.broadcastRoom();
           break;
+        }
         case "serve":
           this.broadcastEvent("serve");
           break;
@@ -497,18 +758,21 @@ export class Room {
       // A slot is a "bot" when it's empty AND bot-fill is on; an empty slot with
       // bot-fill off is just idle (still not a human, but not actively a bot).
       isBot: s.clientId === null && this.sim.botFill,
-      connected: s.clientId !== null
+      connected: s.clientId !== null,
+      // Ready is a ready-screen/countdown thing — always false for bots and
+      // while a match is playing (protocol contract for PlayerView.ready).
+      ready: s.clientId !== null && this.roomMode !== "playing" && s.ready
     }));
-    return {
+    const msg: Extract<ServerMsg, { t: "room" }> = {
       t: "room",
       players,
-      mode: this.sim.mode === "playing"
-        ? "playing"
-        : this.sim.mode === "matchOver"
-        ? "matchOver"
-        : "lobby",
+      mode: this.roomMode,
       botFill: this.sim.botFill
     };
+    if (this.roomMode === "countdown") {
+      msg.countdown = this.countdownLeft;
+    }
+    return msg;
   }
 
   private broadcastRoom(): void {
@@ -527,17 +791,25 @@ export class Room {
 
   // --- helpers -------------------------------------------------------------
 
-  private lowestFreeSlot(): number {
+  /**
+   * Lowest unoccupied slot, or -1. With requireAlive, eliminated slots are
+   * skipped too (used when seating mid-match — a dead paddle can't be played).
+   */
+  private lowestFreeSlot(requireAlive = false): number {
     for (let i = 0; i < this.slots.length; i += 1) {
-      if (this.slots[i].clientId === null) {
+      if (
+        this.slots[i].clientId === null &&
+        (!requireAlive || !this.players[i].eliminated)
+      ) {
         return i;
       }
     }
     return -1;
   }
 
-  private hasHuman(): boolean {
-    return this.slots.some((s) => s.clientId !== null);
+  /** Connected SEATED humans (spectators are not counted anywhere). */
+  private seatedHumans(): number {
+    return this.slots.reduce((n, s) => (s.clientId !== null ? n + 1 : n), 0);
   }
 
   /** Server RNG — Math.random is fine for v1 (no replay determinism needed). */

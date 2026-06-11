@@ -1,14 +1,16 @@
 /**
- * Four Ponq — Stage 1 networked-multiplayer SERVER entry.
+ * Four Ponq — Stage 2 networked-multiplayer SERVER entry.
  *
  * A plain node:http server that:
  *   1. Serves the static client bundle from ./dist (relative to process.cwd(),
- *      which is /app in the container) for every route EXCEPT /ws:
+ *      which is /app in the container) for every route EXCEPT /ws + /presence:
  *        - index.html             → Cache-Control "no-cache" (always revalidate)
  *        - /assets/*  (hashed)    → "public, max-age=31536000, immutable"
  *        - unknown non-asset path → SPA fallback to index.html
  *      with correct content-types for the file extensions the bundle ships.
- *   2. Attaches a `ws` WebSocketServer that accepts the HTTP upgrade ONLY at the
+ *   2. Serves GET /presence — the live PresenceInfo JSON (humans/bots/mode/
+ *      joinable) the hub polls for its channel badge. Always no-cache.
+ *   3. Attaches a `ws` WebSocketServer that accepts the HTTP upgrade ONLY at the
  *      path /ws (any other upgrade path is rejected/destroyed).
  *
  * Build: `npm run build:server` (tsc -p tsconfig.server.json → dist-server/,
@@ -37,6 +39,13 @@ const INDEX_HTML = path.join(DIST_DIR, "index.html");
 
 /** WebSocket upgrade path. Everything else is static-file territory. */
 const WS_PATH = "/ws";
+
+/** Hub presence endpoint (see PresenceInfo in shared/protocol.ts). */
+const PRESENCE_PATH = "/presence";
+
+// One shared room for v1. Declared up here so the HTTP handler below can serve
+// its live presence snapshot.
+const room = new Room();
 
 const CONTENT_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
@@ -143,6 +152,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
   const pathname = url.pathname;
 
+  // Live room presence for the hub channel badge — always fresh, never cached.
+  if (pathname === PRESENCE_PATH) {
+    const body = JSON.stringify(room.presence());
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": Buffer.byteLength(body),
+      "Cache-Control": "no-cache"
+    });
+    res.end(req.method === "HEAD" ? undefined : body);
+    return;
+  }
+
   // Root → index.html (no-cache).
   if (pathname === "/" || pathname === "/index.html") {
     await serveIndex(res);
@@ -184,9 +205,6 @@ const server = http.createServer((req, res) => {
     res.end("internal server error");
   });
 });
-
-// One shared room for v1.
-const room = new Room();
 
 // `noServer: true` so we can authorize the upgrade path ourselves and reject
 // any upgrade that is not exactly /ws.
@@ -245,7 +263,7 @@ wss.on("connection", (ws: WebSocket) => {
           return; // ignore a second hello
         }
         joined = true;
-        room.join(conn, typeof msg.name === "string" ? msg.name : "");
+        room.connect(conn, typeof msg.name === "string" ? msg.name : "");
         break;
       }
       case "input": {
@@ -253,9 +271,20 @@ wss.on("connection", (ws: WebSocket) => {
         room.setInput(clientId, !!msg.ccw, !!msg.cw, !!msg.charge);
         break;
       }
-      case "start": {
+      case "join": {
         if (!joined) return;
-        room.start();
+        room.requestSeat(clientId);
+        break;
+      }
+      case "ready": {
+        if (!joined) return;
+        room.ready(clientId, !!msg.on);
+        break;
+      }
+      case "start": {
+        // Legacy alias for {t:"ready", on:true}.
+        if (!joined) return;
+        room.ready(clientId, true);
         break;
       }
       case "setBots": {
