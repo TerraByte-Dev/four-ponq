@@ -29,6 +29,14 @@ RUN { \
       echo '  location / {'; \
       echo '    try_files $uri $uri/ /index.html;'; \
       echo '  }'; \
+      echo '  # HTML must always revalidate so menu/overlay updates land immediately'; \
+      echo '  location = /index.html {'; \
+      echo '    add_header Cache-Control "no-cache";'; \
+      echo '  }'; \
+      echo '  # Content-hashed build assets are safe to cache forever'; \
+      echo '  location /assets/ {'; \
+      echo '    add_header Cache-Control "public, max-age=31536000, immutable";'; \
+      echo '  }'; \
       echo '}'; \
     } > /etc/nginx/conf.d/default.conf
 
