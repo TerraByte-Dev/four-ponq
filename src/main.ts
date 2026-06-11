@@ -338,6 +338,9 @@ class FourPongScene extends Phaser.Scene {
   private lastPaddleHitSoundAt = -Infinity;
   private activeMusic?: Phaser.Sound.BaseSound;
   private activeMusicKey?: string;
+  private homeOverlayOpen = false;
+  private pausedByHomeOverlay = false;
+  private prevSoundMute = false;
 
   constructor() {
     super("four-pong");
@@ -383,6 +386,8 @@ class FourPongScene extends Phaser.Scene {
     window.addEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.addEventListener("four-pong:set-volume", this.handleVolumeEvent);
     window.addEventListener("keydown", this.handleWindowKeyDown);
+    window.addEventListener("arcade:home-open", this.handleHomeOpen);
+    window.addEventListener("arcade:home-close", this.handleHomeClose);
 
     this.keys = this.input.keyboard!.addKeys({
       counterclockwise: Phaser.Input.Keyboard.KeyCodes.A,
@@ -417,6 +422,8 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.removeEventListener("four-pong:set-volume", this.handleVolumeEvent);
     window.removeEventListener("keydown", this.handleWindowKeyDown);
+    window.removeEventListener("arcade:home-open", this.handleHomeOpen);
+    window.removeEventListener("arcade:home-close", this.handleHomeClose);
     this.stopMusic();
   }
 
@@ -480,6 +487,7 @@ class FourPongScene extends Phaser.Scene {
     if (this.mode === "paused") {
       this.mode = "playing";
       this.message = "Back in motion.";
+      this.resumeRoundIfStalled();
       this.emitHud();
       return;
     }
@@ -1524,7 +1532,22 @@ class FourPongScene extends Phaser.Scene {
 
     this.mode = this.mode === "paused" ? "playing" : "paused";
     this.message = this.mode === "paused" ? "Paused. Press Esc, Space, or Resume." : "Back in motion.";
+    if (this.mode === "playing") {
+      this.resumeRoundIfStalled();
+    }
     this.emitHud();
+  }
+
+  /**
+   * handleGoals() schedules resetRound via delayedCall gated on
+   * mode === "playing". Pausing inside that window drops the reset and
+   * leaves roundResolving stuck true (frozen ball). Every resume path calls
+   * this to re-serve if that happened.
+   */
+  private resumeRoundIfStalled() {
+    if (this.roundResolving) {
+      this.resetRound();
+    }
   }
 
   private toggleBotFill() {
@@ -1575,20 +1598,7 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private arena(): ArenaGeometry {
-    const width = this.scale.width || 960;
-    const height = this.scale.height || 640;
-    const hudSafeTop = width < 760 ? 142 : 92;
-    const controlsSafeBottom = width < 760 ? 118 : 70;
-    const centerY = hudSafeTop + (height - hudSafeTop - controlsSafeBottom) / 2;
-    const radius = Math.max(126, Math.min(width * 0.43, (height - hudSafeTop - controlsSafeBottom) * 0.48));
-
-    return {
-      center: new Phaser.Math.Vector2(width / 2, centerY),
-      radius,
-      paddleThickness: Math.max(16, Math.min(24, radius * 0.085)),
-      paddleAngleSpan: Math.max(0.252, Math.min(0.468, 68.4 / radius)),
-      triangleRadius: Math.max(32, Math.min(56, radius * 0.18))
-    };
+    return computeArena(this.scale.width || 960, this.scale.height || 640);
   }
 
   private triangleVertices(arena: ArenaGeometry) {
@@ -1629,17 +1639,65 @@ class FourPongScene extends Phaser.Scene {
     return Math.min(span * 0.46, Math.max(0.04, halfPaddleAngle));
   }
 
-  private handleResize() {
+  private handleResize(
+    gameSize: Phaser.Structs.Size,
+    _baseSize: Phaser.Structs.Size,
+    _displaySize: Phaser.Structs.Size,
+    previousWidth: number,
+    previousHeight: number
+  ) {
     if (this.caughtByPlayerId !== undefined) {
       this.updateCaughtBall();
       return;
     }
 
-    this.resetRound(undefined, false);
+    // Remap the ball into the new arena instead of re-serving: window drags,
+    // devtools, and overlay reflows no longer reset the round mid-rally.
+    const old = computeArena(previousWidth || gameSize.width, previousHeight || gameSize.height);
+    const next = computeArena(gameSize.width, gameSize.height);
+    const offset = this.ball.clone().subtract(old.center).scale(next.radius / old.radius);
+    this.ball.copy(next.center.clone().add(offset));
+    // Velocity magnitude is intentionally left unchanged; paddle angles are
+    // radians and need no remap. Stale trail points would smear, so drop them.
+    this.ballTrail = [];
+    this.paddleImpactBursts = [];
   }
 
   private handleStartEvent = () => {
     this.startGame();
+  };
+
+  // Arcade HOME overlay (hub-injected /__arcade/home.js). Safe no-ops if the
+  // overlay script never loads: these events simply never fire.
+  private handleHomeOpen = () => {
+    this.homeOverlayOpen = true;
+    this.pausedByHomeOverlay = this.mode === "playing";
+    if (this.pausedByHomeOverlay) {
+      this.mode = "paused";
+      this.message = "Paused for the arcade menu.";
+      this.emitHud();
+    }
+    // Mute everything (SFX one-shots included); music pauses itself via the
+    // mode !== "playing" check in updateMusic().
+    this.prevSoundMute = this.sound.mute;
+    this.sound.mute = true;
+  };
+
+  private handleHomeClose = () => {
+    this.sound.mute = this.prevSoundMute;
+    if (this.pausedByHomeOverlay && this.mode === "paused") {
+      this.mode = "playing";
+      this.message = "Back in motion.";
+      this.resumeRoundIfStalled();
+      this.emitHud();
+    }
+    this.pausedByHomeOverlay = false;
+    // Keep the flag set until after this keydown dispatch finishes: the
+    // overlay closes on the same Esc press the game's keydown handler will
+    // still see, and it must ignore it instead of re-pausing.
+    window.setTimeout(() => {
+      this.homeOverlayOpen = false;
+    }, 0);
   };
 
   private handlePauseEvent = () => {
@@ -1686,6 +1744,10 @@ class FourPongScene extends Phaser.Scene {
   };
 
   private handleWindowKeyDown = (event: KeyboardEvent) => {
+    if (this.homeOverlayOpen) {
+      return;
+    }
+
     if (event.repeat) {
       return;
     }
@@ -1718,6 +1780,26 @@ class FourPongScene extends Phaser.Scene {
 
     window.dispatchEvent(new CustomEvent<HudState>("four-pong:hud", { detail: state }));
   }
+}
+
+/**
+ * Pure arena layout: derives the play circle from a viewport size.
+ * Kept free of scene state so resize remapping (and future netcode) can
+ * compute geometry for arbitrary dimensions.
+ */
+function computeArena(width: number, height: number): ArenaGeometry {
+  const hudSafeTop = width < 760 ? 142 : 92;
+  const controlsSafeBottom = width < 760 ? 118 : 70;
+  const centerY = hudSafeTop + (height - hudSafeTop - controlsSafeBottom) / 2;
+  const radius = Math.max(126, Math.min(width * 0.43, (height - hudSafeTop - controlsSafeBottom) * 0.48));
+
+  return {
+    center: new Phaser.Math.Vector2(width / 2, centerY),
+    radius,
+    paddleThickness: Math.max(16, Math.min(24, radius * 0.085)),
+    paddleAngleSpan: Math.max(0.252, Math.min(0.468, 68.4 / radius)),
+    triangleRadius: Math.max(32, Math.min(56, radius * 0.18))
+  };
 }
 
 function normalizeAngle(angle: number) {
@@ -1820,8 +1902,7 @@ const game = new Phaser.Game({
   scale: {
     mode: Phaser.Scale.RESIZE,
     parent: "game-root",
-    width: "100%",
-    height: "100%"
+    autoRound: true
   },
   scene: FourPongScene,
   render: {

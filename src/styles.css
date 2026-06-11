@@ -87,6 +87,14 @@ body,
   margin: 0;
 }
 
+/* Track the dynamic viewport on mobile so browser chrome (URL bar) resizes the shell live. */
+@supports (height: 100dvh) {
+  html,
+  body {
+    height: 100dvh;
+  }
+}
+
 body {
   overflow: hidden;
   background: var(--bg);
@@ -95,8 +103,8 @@ body {
 
 #game-shell {
   position: relative;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
   min-width: 320px;
   min-height: 480px;
   background:
@@ -120,6 +128,9 @@ body {
   top: 14px;
   left: 14px;
   right: 14px;
+  top: max(14px, env(safe-area-inset-top));
+  left: max(14px, env(safe-area-inset-left));
+  right: max(14px, env(safe-area-inset-right));
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -228,6 +239,8 @@ body {
   z-index: 3;
   right: 14px;
   bottom: 14px;
+  right: max(14px, env(safe-area-inset-right));
+  bottom: max(14px, env(safe-area-inset-bottom));
   min-width: 92px;
   min-height: 42px;
   color: var(--text);
@@ -251,6 +264,8 @@ body {
   z-index: 2;
   left: 14px;
   bottom: 14px;
+  left: max(14px, env(safe-area-inset-left));
+  bottom: max(14px, env(safe-area-inset-bottom));
   display: flex;
   flex-wrap: wrap;
   max-width: min(680px, calc(100vw - 130px));
@@ -291,6 +306,7 @@ body {
 .menu-panel {
   width: min(440px, calc(100vw - 36px));
   max-height: calc(100vh - 208px);
+  max-height: calc(100dvh - 208px);
   overflow-y: auto;
   padding: 24px;
 }
@@ -607,6 +623,9 @@ body {
     top: 10px;
     left: 10px;
     right: 10px;
+    top: max(10px, env(safe-area-inset-top));
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
     flex-direction: column;
   }
 
@@ -641,6 +660,9 @@ body {
     left: 10px;
     right: 10px;
     bottom: 64px;
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(64px, calc(54px + env(safe-area-inset-bottom)));
     max-width: none;
     font-size: 0.7rem;
   }
@@ -648,6 +670,8 @@ body {
   #pause-button {
     right: 10px;
     bottom: 10px;
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(10px, env(safe-area-inset-bottom));
   }
 
   #menu-overlay {
@@ -657,6 +681,7 @@ body {
 
   .menu-panel {
     max-height: calc(100vh - 284px);
+    max-height: calc(100dvh - 284px);
     padding: 18px;
   }
 
