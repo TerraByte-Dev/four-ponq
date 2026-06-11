@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.*
+*.log
+.vscode
+.idea
+README.md
+.DS_Store
+Thumbs.db
+audio-examples
+playtest-desktop.png
+playtest-mobile.png
+HANDOFF.md
+Feedback.md

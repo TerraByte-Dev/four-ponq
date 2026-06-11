@@ -1,0 +1,11 @@
+{
+  "id": "four-ponq",
+  "title": "Four Ponq",
+  "subdomain": "four-ponq",
+  "thumbnail": "/assets/games/four-ponq.svg",
+  "players": "1-4",
+  "tags": ["multiplayer", "action", "arcade"],
+  "accent": "#2c8fd6",
+  "memLimitMb": 128,
+  "source": "https://github.com/Deaxohn/four-ponq"
+}
