@@ -1,0 +1,24 @@
+{
+  // Server build: compiles server/ + shared/ + src/sim/ to CommonJS for Node.
+  // Node-only lib set (NO DOM) — the sim modules are DOM-free, so this proves
+  // they run headless. Emits to dist-server/, preserving the source folder
+  // layout (entry: dist-server/server/index.js).
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "lib": ["ES2020"],
+    "outDir": "dist-server",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": false,
+    "declaration": false,
+    "noEmitOnError": true
+  },
+  "include": ["server/**/*.ts", "shared/**/*.ts", "src/sim/**/*.ts"]
+}

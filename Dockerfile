@@ -1,46 +1,54 @@
-# Multi-stage Dockerfile for a Vite (or webpack / esbuild / etc.) SPA.
-# Builds the static bundle, then serves it from a tiny nginx-alpine image.
-# Final image ~25 MB. Listens on port 3000.
+# Multi-stage Dockerfile for four-ponq (Stage 1 networked multiplayer).
+#
+# Shape: node-ws (NOT the old vite-static/nginx shape).
+#   build   — node:20-alpine: npm ci, then `npm run build` produces BOTH the
+#             client SPA bundle (dist/) AND the compiled CommonJS server
+#             (dist-server/, with a {"type":"commonjs"} marker so Node runs the
+#             CJS output even though the package is "type":"module").
+#   deps    — node:20-alpine: production-only node_modules (npm ci --omit=dev),
+#             so the runtime image carries `ws` but not vite/typescript/etc.
+#   runtime — node:20-alpine (NOT nginx): runs `node` on the compiled server.
+#
+# The server listens on 0.0.0.0:3000, serves the static client bundle from
+# ./dist for all non-/ws routes, and handles the WebSocket upgrade at /ws.
+#
+# Cache-Control parity with the old nginx config is the SERVER's job (set in
+# the node static handler): index.html -> "no-cache" (always revalidate so
+# menu/overlay updates land immediately); hashed /assets/* ->
+# "public, max-age=31536000, immutable". This Dockerfile just ships the bundle.
 
-# ---------- Stage 1: build ----------
+# ---------- Stage 1: build (client bundle + compiled server) ----------
 FROM node:20-alpine AS build
 WORKDIR /app
 
-# Dependency install — cached unless package.json changes
+# Install ALL deps (incl. vite/typescript) — cached unless package*.json change.
 COPY package*.json ./
 RUN npm ci
 
-# Build the static bundle
+# Build both targets: `npm run build` = build:client (tsc && vite build -> dist/)
+# then build:server (tsc -p tsconfig.server.json -> dist-server/ + CJS marker).
 COPY . .
 RUN npm run build
 
-# ---------- Stage 2: serve ----------
-FROM nginx:alpine
+# ---------- Stage 2: production deps only ----------
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
 
-# Replace the default nginx config so it listens on 3000 (arcade convention)
-RUN { \
-      echo 'server {'; \
-      echo '  listen 3000;'; \
-      echo '  server_name _;'; \
-      echo '  root /usr/share/nginx/html;'; \
-      echo '  index index.html;'; \
-      echo '  include /etc/nginx/mime.types;'; \
-      echo '  default_type application/octet-stream;'; \
-      echo '  location / {'; \
-      echo '    try_files $uri $uri/ /index.html;'; \
-      echo '  }'; \
-      echo '  # HTML must always revalidate so menu/overlay updates land immediately'; \
-      echo '  location = /index.html {'; \
-      echo '    add_header Cache-Control "no-cache";'; \
-      echo '  }'; \
-      echo '  # Content-hashed build assets are safe to cache forever'; \
-      echo '  location /assets/ {'; \
-      echo '    add_header Cache-Control "public, max-age=31536000, immutable";'; \
-      echo '  }'; \
-      echo '}'; \
-    } > /etc/nginx/conf.d/default.conf
+# ---------- Stage 3: runtime (node, NOT nginx) ----------
+FROM node:20-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
 
-COPY --from=build /app/dist /usr/share/nginx/html
+# Production node_modules (carries `ws`; no build toolchain).
+COPY --from=deps   /app/node_modules ./node_modules
+# Compiled CommonJS server (+ its dist-server/package.json CJS marker).
+COPY --from=build  /app/dist-server  ./dist-server
+# Static client bundle the server serves for all non-/ws routes.
+COPY --from=build  /app/dist         ./dist
+# Manifest (for `npm start` resolution and metadata).
+COPY package.json ./
 
 EXPOSE 3000
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["node", "dist-server/server/index.js"]
