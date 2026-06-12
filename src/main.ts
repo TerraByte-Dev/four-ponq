@@ -460,7 +460,6 @@ class FourPongScene extends Phaser.Scene {
       clockwise: Phaser.Input.Keyboard.KeyCodes.D,
       reset: Phaser.Input.Keyboard.KeyCodes.R,
       pause: Phaser.Input.Keyboard.KeyCodes.SPACE,
-      escape: Phaser.Input.Keyboard.KeyCodes.ESC,
       bot: Phaser.Input.Keyboard.KeyCodes.B
     }) as Record<string, Phaser.Input.Keyboard.Key>;
 
@@ -1693,11 +1692,11 @@ class FourPongScene extends Phaser.Scene {
       return;
     }
 
-    // Esc drives the game's OWN pause menu (Resume + Bot Fill card). The arcade
-    // HOME overlay opts out of Esc via data-esc="off" on its <script> tag, so the
-    // keystroke reaches us here. The early-return above means that while HOME is
-    // open the overlay owns Esc (it closes itself) and we never toggle pause.
-    if (event.code === "Escape") {
+    // M opens the game's OWN menu/pause card (Resume + Bot Fill + Settings).
+    // Esc is reserved for the arcade HOME (Wii) overlay, which binds Esc itself
+    // (the overlay <script> no longer carries data-esc="off"), so we never touch
+    // Escape here — it falls straight through to the overlay.
+    if (event.code === "KeyM") {
       event.preventDefault();
       this.togglePause();
       return;
