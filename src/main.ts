@@ -71,6 +71,8 @@ interface HudState {
   triangleMotionMode: TriangleMotionMode;
   musicVolume: number;
   sfxVolume: number;
+  /** The local player's chosen display name (sent to the server as our name). */
+  playerName: string;
   /**
    * True while the ONLINE session screens (spectator banner / ready panel /
    * countdown) own the overlay layer — the legacy offline menu card stays
@@ -321,6 +323,8 @@ class FourPongScene extends Phaser.Scene {
   private themeId: ThemeId = "neon";
   private musicVolume = 0.02;
   private sfxVolume = 0.05;
+  /** Persisted, player-editable display name (defaults to a random one). */
+  private playerName = loadOrCreatePlayerName();
   /** Eased camera spin that keeps the local player's side at screen-top. */
   private currentViewRotation = 0;
   private paddleImpactBursts: PaddleImpactBurst[] = [];
@@ -438,6 +442,7 @@ class FourPongScene extends Phaser.Scene {
     window.addEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.addEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.addEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.addEventListener("four-pong:set-name", this.handleSetNameEvent);
     window.addEventListener("four-pong:join", this.handleJoinEvent);
     window.addEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.addEventListener("keydown", this.handleWindowKeyDown);
@@ -454,7 +459,9 @@ class FourPongScene extends Phaser.Scene {
     }) as Record<string, Phaser.Input.Keyboard.Key>;
 
     this.players = [
-      this.createPlayer(1, "P1", 0x62e6ff, "#62e6ff"),
+      // Slot 0 is the local player offline; show their chosen name. Networked
+      // play overwrites all four names from the server roster via handleNetChange.
+      this.createPlayer(1, this.playerName, 0x62e6ff, "#62e6ff"),
       this.createPlayer(2, "P2", 0xff6f91, "#ff6f91"),
       this.createPlayer(3, "P3", 0xf8d66d, "#f8d66d"),
       this.createPlayer(4, "P4", 0x69db7c, "#69db7c")
@@ -477,7 +484,7 @@ class FourPongScene extends Phaser.Scene {
    */
   private connectNet() {
     this.net = new NetClient({
-      name: "P1",
+      name: this.playerName,
       onEvent: (kind, data) => this.handleNetEvent(kind, data),
       onChange: () => this.handleNetChange(),
       onSeated: (slot) => this.handleSeated(slot)
@@ -624,6 +631,7 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.removeEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.removeEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.removeEventListener("four-pong:set-name", this.handleSetNameEvent);
     window.removeEventListener("four-pong:join", this.handleJoinEvent);
     window.removeEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.removeEventListener("keydown", this.handleWindowKeyDown);
@@ -1609,6 +1617,32 @@ class FourPongScene extends Phaser.Scene {
     }
   };
 
+  private handleSetNameEvent = (event: Event) => {
+    const detail = (event as CustomEvent<{ name: string }>).detail;
+    if (detail && typeof detail.name === "string") {
+      this.setPlayerName(detail.name);
+    }
+  };
+
+  /**
+   * Set the local display name: sanitize, persist, push to the server (live
+   * rename if connected), and refresh the HUD. A blank entry falls back to a
+   * fresh random name so a player is never left nameless.
+   */
+  private setPlayerName(raw: string) {
+    const clean = sanitizePlayerName(raw) || randomPlayerName();
+    this.playerName = clean;
+    storePlayerName(clean);
+    this.net?.setName(clean);
+    // Reflect immediately in our own roster row offline (online the server
+    // echoes the new name back via {room}); harmless to set in both.
+    const localSlot = this.networked && this.net ? this.net.slot : 0;
+    if (localSlot >= 0 && this.players[localSlot]) {
+      this.players[localSlot].name = clean;
+    }
+    this.emitHud();
+  }
+
   private handleWindowKeyDown = (event: KeyboardEvent) => {
     if (this.homeOverlayOpen) {
       return;
@@ -1708,6 +1742,7 @@ class FourPongScene extends Phaser.Scene {
       triangleMotionMode: this.triangleMotionMode,
       musicVolume: this.musicVolume,
       sfxVolume: this.sfxVolume,
+      playerName: this.playerName,
       netSession: this.networked && this.mode !== "paused"
     };
 
@@ -1818,6 +1853,8 @@ const triangleMotionButtons = Array.from(document.querySelectorAll<HTMLButtonEle
 const menuTriangleState = document.querySelector<HTMLSpanElement>("#menu-triangle-state")!;
 const musicVolumeInput = document.querySelector<HTMLInputElement>("#music-volume")!;
 const sfxVolumeInput = document.querySelector<HTMLInputElement>("#sfx-volume")!;
+const playerNameInput = document.querySelector<HTMLInputElement>("#player-name-input")!;
+const playerNameRandomButton = document.querySelector<HTMLButtonElement>("#player-name-random")!;
 const menuMusicVolume = document.querySelector<HTMLElement>("#menu-music-volume")!;
 const menuSfxVolume = document.querySelector<HTMLElement>("#menu-sfx-volume")!;
 const menuMusicState = document.querySelector<HTMLElement>("#menu-music-state")!;
@@ -1900,6 +1937,10 @@ window.addEventListener("four-pong:hud", (event) => {
   menuMusicVolume.textContent = `${musicPercent}%`;
   menuSfxVolume.textContent = `${sfxPercent}%`;
   menuMusicState.textContent = `${musicPercent}%`;
+  // Don't clobber the field while the player is mid-edit.
+  if (document.activeElement !== playerNameInput) {
+    playerNameInput.value = state.playerName;
+  }
   document.body.dataset.theme = THEMES[state.themeId].shellTheme;
   difficultyButtons.forEach((button) => {
     const active = button.dataset.difficulty === state.botDifficulty;
@@ -2070,6 +2111,23 @@ function bindVolumeInput(input: HTMLInputElement, target: VolumeTarget) {
 bindVolumeInput(musicVolumeInput, "music");
 bindVolumeInput(sfxVolumeInput, "sfx");
 
+function commitPlayerName(name: string) {
+  window.dispatchEvent(new CustomEvent<{ name: string }>("four-pong:set-name", { detail: { name } }));
+}
+// Commit the typed name when the field loses focus or Enter is pressed (not on
+// every keystroke — that would fire a server rename per character).
+playerNameInput.addEventListener("change", () => commitPlayerName(playerNameInput.value));
+playerNameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    playerNameInput.blur();
+  }
+});
+playerNameRandomButton.addEventListener("click", () => {
+  const fresh = randomPlayerName();
+  playerNameInput.value = fresh;
+  commitPlayerName(fresh);
+});
+
 pauseButton.addEventListener("click", () => {
   // The on-screen Pause button toggles the GAME's own pause menu (Resume + Bot
   // Fill card). The arcade HOME overlay is reached only from its floating house
@@ -2081,6 +2139,51 @@ void game;
 
 function titleCase(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
+// --- player name (random default, editable, persisted) ----------------------
+
+const PLAYER_NAME_KEY = "four-ponq:player-name";
+const PLAYER_NAME_NOUNS = [
+  "Falcon", "Comet", "Pixel", "Volt", "Ember", "Nova", "Quartz", "Zephyr",
+  "Onyx", "Cobra", "Lynx", "Drift", "Maple", "Rune", "Glyph", "Vapor",
+  "Echo", "Flint", "Bolt", "Wisp", "Jet", "Sage", "Koi", "Pulse"
+] as const;
+
+/** Strip control/non-ASCII chars, trim, cap at 12 (mirrors the server's clamp). */
+function sanitizePlayerName(raw: string): string {
+  return raw.replace(/[^ -~]/g, "").trim().slice(0, 12);
+}
+
+/** A short, friendly random handle like "Volt42" (always <= 12 chars). */
+function randomPlayerName(): string {
+  const noun = PLAYER_NAME_NOUNS[Math.floor(Math.random() * PLAYER_NAME_NOUNS.length)];
+  const suffix = 10 + Math.floor(Math.random() * 90);
+  return `${noun}${suffix}`.slice(0, 12);
+}
+
+/** Read the saved name (sanitized); mint + persist a random one on first run. */
+function loadOrCreatePlayerName(): string {
+  try {
+    const stored = localStorage.getItem(PLAYER_NAME_KEY);
+    const clean = stored ? sanitizePlayerName(stored) : "";
+    if (clean) {
+      return clean;
+    }
+  } catch {
+    // localStorage unavailable (private mode etc.) — fall through to a fresh name.
+  }
+  const fresh = randomPlayerName();
+  storePlayerName(fresh);
+  return fresh;
+}
+
+function storePlayerName(name: string): void {
+  try {
+    localStorage.setItem(PLAYER_NAME_KEY, name);
+  } catch {
+    // Best-effort; a non-persisted name is still fine for the session.
+  }
 }
 
 /** Server-provided names flow into innerHTML — escape them. */

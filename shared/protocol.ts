@@ -46,6 +46,8 @@ export const COUNTDOWN_SECONDS = 3;
 export type ClientMsg =
   /** Introduce yourself. You are seated (lobby) or made a spectator (live match). */
   | { t: "hello"; name: string }
+  /** Live rename — updates your roster name (and seat name, if seated). */
+  | { t: "setName"; name: string }
   /** Change-only input; each field is sticky until the next input message. */
   | { t: "input"; ccw: boolean; cw: boolean; charge: boolean }
   /** Spectator asks for a seat ("Jump in?"). Seated now, or at the next serve. */

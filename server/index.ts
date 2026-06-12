@@ -266,6 +266,11 @@ wss.on("connection", (ws: WebSocket) => {
         room.connect(conn, typeof msg.name === "string" ? msg.name : "");
         break;
       }
+      case "setName": {
+        if (!joined) return;
+        room.setName(clientId, typeof msg.name === "string" ? msg.name : "");
+        break;
+      }
       case "input": {
         if (!joined) return;
         room.setInput(clientId, !!msg.ccw, !!msg.cw, !!msg.charge);

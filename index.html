@@ -44,7 +44,14 @@
               </div>
             </div>
             <div data-menu-panel="settings" hidden>
-              <p>Computer opponents only move themselves. P1 stays under live A/D control.</p>
+              <p>Computer opponents only move themselves. Your paddle stays under live A/D control.</p>
+              <div class="settings-group" aria-label="Display name">
+                <span>Display name</span>
+                <div class="name-row">
+                  <input id="player-name-input" type="text" maxlength="12" autocomplete="off" spellcheck="false" placeholder="Your name" aria-label="Your display name" />
+                  <button type="button" id="player-name-random" aria-label="Pick a random name">Random</button>
+                </div>
+              </div>
               <div class="settings-group" aria-label="Computer difficulty">
                 <span>Computer difficulty</span>
                 <div class="difficulty-row">
@@ -71,13 +78,13 @@
                 <span>Audio</span>
                 <label class="volume-row">
                   <span>Music</span>
-                  <input id="music-volume" type="range" min="0" max="100" value="58" />
-                  <em id="menu-music-volume">58%</em>
+                  <input id="music-volume" type="range" min="0" max="100" value="2" />
+                  <em id="menu-music-volume">2%</em>
                 </label>
                 <label class="volume-row">
                   <span>SFX</span>
-                  <input id="sfx-volume" type="range" min="0" max="100" value="82" />
-                  <em id="menu-sfx-volume">82%</em>
+                  <input id="sfx-volume" type="range" min="0" max="100" value="5" />
+                  <em id="menu-sfx-volume">5%</em>
                 </label>
               </div>
               <div class="settings-group" aria-label="Theme">
@@ -111,7 +118,7 @@
                 <span><strong>Paddles</strong> concave</span>
                 <span><strong>Theme</strong> <em id="menu-theme-state">Neon Classic</em></span>
                 <span><strong>CPU</strong> <em id="menu-difficulty-state">Medium</em></span>
-                <span><strong>Music</strong> <em id="menu-music-state">58%</em></span>
+                <span><strong>Music</strong> <em id="menu-music-state">2%</em></span>
               </div>
             </div>
           </div>

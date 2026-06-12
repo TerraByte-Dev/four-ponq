@@ -178,6 +178,12 @@ export class NetClient {
     this.send({ t: "input", ccw, cw, charge });
   }
 
+  /** Live rename — update the hello name we'd resend and tell the server now. */
+  setName(name: string): void {
+    this.opts.name = name;
+    this.send({ t: "setName", name });
+  }
+
   /** Spectator → "Jump in?". No-op while a deferred seat is already pending. */
   sendJoin(): void {
     if (this._joinPending) {

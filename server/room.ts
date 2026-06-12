@@ -340,6 +340,27 @@ export class Room {
     return seated;
   }
 
+  /**
+   * Live rename. Updates the stored hello name (so it survives a later seating)
+   * and, if the client is seated, the slot's display name, then rebroadcasts the
+   * roster. An empty/blank name after sanitizing is ignored (keeps the current).
+   */
+  setName(clientId: string, name: string): void {
+    if (!this.conns.has(clientId)) {
+      return;
+    }
+    const clean = sanitizeName(name);
+    if (!clean) {
+      return;
+    }
+    this.helloNames.set(clientId, clean);
+    const slot = this.slots.findIndex((s) => s.clientId === clientId);
+    if (slot >= 0) {
+      this.slots[slot].name = clean;
+      this.broadcastRoom();
+    }
+  }
+
   /** Apply a human's sticky input to their slot. */
   setInput(clientId: string, ccw: boolean, cw: boolean, charge: boolean): void {
     const slot = this.slots.findIndex((s) => s.clientId === clientId);

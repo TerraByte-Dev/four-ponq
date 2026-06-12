@@ -590,6 +590,49 @@ body.arcade-home-active #menu-overlay {
   text-align: right;
 }
 
+.name-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.name-row input {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  font: inherit;
+  font-weight: 800;
+}
+
+.name-row input:focus-visible {
+  outline: 2px solid var(--cool);
+  outline-offset: 1px;
+}
+
+.name-row button {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.name-row button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .theme-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
