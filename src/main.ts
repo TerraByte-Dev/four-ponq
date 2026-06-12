@@ -475,6 +475,31 @@ class FourPongScene extends Phaser.Scene {
     this.emitHud();
 
     this.connectNet();
+    void this.adoptArcadeProfileName();
+  }
+
+  /**
+   * Pull the player's hub profile name from the arcade backend (same-origin
+   * /api/profile, routed to arcade-api by Caddy on every game subdomain) and
+   * adopt it as our display name. The hub stores the chosen name keyed by the
+   * verified Access email; this is how a per-browser game shows the SAME name
+   * the player set in the arcade hub. Best-effort: a 404 (local dev), a network
+   * error, or an empty name all leave the local random/persisted name in place.
+   */
+  private async adoptArcadeProfileName() {
+    try {
+      const res = await fetch("/api/profile", { cache: "no-store" });
+      if (!res.ok) {
+        return;
+      }
+      const data = (await res.json()) as { displayName?: unknown };
+      const name = typeof data.displayName === "string" ? sanitizePlayerName(data.displayName) : "";
+      if (name && name !== this.playerName) {
+        this.setPlayerName(name);
+      }
+    } catch {
+      // No arcade backend reachable — keep the local name.
+    }
   }
 
   /**
