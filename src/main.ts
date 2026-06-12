@@ -167,6 +167,12 @@ const PADDLE_HIT_INDICATOR_LENGTH = 34;
 const PADDLE_HIT_INDICATOR_GAP = 4;
 const PADDLE_HIT_INDICATOR_FAN_ANGLE = 0.48;
 const PADDLE_HIT_SOUND_COOLDOWN = 500;
+/**
+ * Master volume ceiling: the music/SFX sliders' 100% maps to this fraction of
+ * full output, so the loudest setting is far gentler (the old 20% IS the new
+ * 100%). Applied to every actual play() gain; the sliders stay 0–100%.
+ */
+const VOLUME_CEILING = 0.2;
 const PADDLE_HIT_SOUND_VOLUME = 0.56;
 /** How long the "that's YOUR paddle" pulse runs after the server seats us (ms). */
 const SEAT_FLASH_DURATION = 2600;
@@ -1261,18 +1267,28 @@ class FourPongScene extends Phaser.Scene {
     }
 
     const key = PADDLE_HIT_SOUND_KEYS[Phaser.Math.Between(0, PADDLE_HIT_SOUND_KEYS.length - 1)];
-    this.sound.play(key, { volume: PADDLE_HIT_SOUND_VOLUME * this.sfxVolume });
+    this.sound.play(key, { volume: this.sfxGain(PADDLE_HIT_SOUND_VOLUME) });
     this.lastPaddleHitSoundAt = this.elapsed;
   }
 
   private playWinFanfare() {
     const key = WIN_FANFARE_KEYS[Phaser.Math.Between(0, WIN_FANFARE_KEYS.length - 1)];
-    this.sound.play(key, { volume: WIN_FANFARE_VOLUME * this.sfxVolume });
+    this.sound.play(key, { volume: this.sfxGain(WIN_FANFARE_VOLUME) });
   }
 
   /** 3-2-1 tick — a fixed bright clonk so every second sounds identical. */
   private playCountdownTick() {
-    this.sound.play("paddle-clonk-06", { volume: COUNTDOWN_TICK_VOLUME * this.sfxVolume });
+    this.sound.play("paddle-clonk-06", { volume: this.sfxGain(COUNTDOWN_TICK_VOLUME) });
+  }
+
+  /** Actual music gain = slider fraction, capped by the master ceiling. */
+  private musicGain(): number {
+    return this.musicVolume * VOLUME_CEILING;
+  }
+
+  /** Actual SFX gain for a sound = its base level x slider fraction x ceiling. */
+  private sfxGain(base: number): number {
+    return base * this.sfxVolume * VOLUME_CEILING;
   }
 
   private updateMusic() {
@@ -1291,12 +1307,12 @@ class FourPongScene extends Phaser.Scene {
       this.stopMusic();
       this.activeMusic = this.sound.add(track.key, {
         loop: true,
-        volume: this.musicVolume
+        volume: this.musicGain()
       });
       this.activeMusicKey = track.key;
     }
 
-    this.setSoundVolume(this.activeMusic, this.musicVolume);
+    this.setSoundVolume(this.activeMusic, this.musicGain());
     if (this.activeMusic && !this.activeMusic.isPlaying) {
       this.activeMusic.play();
     }
@@ -1346,7 +1362,7 @@ class FourPongScene extends Phaser.Scene {
     const normalized = Phaser.Math.Clamp(volume, 0, 1);
     if (target === "music") {
       this.musicVolume = normalized;
-      this.setSoundVolume(this.activeMusic, this.musicVolume);
+      this.setSoundVolume(this.activeMusic, this.musicGain());
     } else {
       this.sfxVolume = normalized;
     }
