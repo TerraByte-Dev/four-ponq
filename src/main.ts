@@ -319,8 +319,8 @@ class FourPongScene extends Phaser.Scene {
   private rng: () => number = Math.random;
   private message = "Circular 4 Player is ready.";
   private themeId: ThemeId = "neon";
-  private musicVolume = 0.58;
-  private sfxVolume = 0.82;
+  private musicVolume = 0.22;
+  private sfxVolume = 0.3;
   private paddleImpactBursts: PaddleImpactBurst[] = [];
   private ballTrail: BallTrailPoint[] = [];
   private confettiParticles: ConfettiParticle[] = [];

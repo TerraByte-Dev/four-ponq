@@ -396,16 +396,47 @@ export function stepMenuPreview(state: SimState, arena: ArenaGeometry, dt: numbe
 }
 
 function handleTriangleCollision(state: SimState, arena: ArenaGeometry, events: SimEvent[]): void {
-  const vertices = triangleVertices(arena, state.triangleRotation);
-
-  if (pointInTriangle(state.ball, vertices[0], vertices[1], vertices[2])) {
-    state.triangleCollisionDisabledUntil = state.elapsed + TRIANGLE_PHASE_DELAY;
-    clearTouchState(state);
-    state.lastTouchType = "triangle";
+  // During the intentional post-serve phase window the ball flies out from the
+  // arena center straight through the triangle — no collision at all.
+  if (state.elapsed < state.triangleCollisionDisabledUntil) {
     return;
   }
 
-  if (state.elapsed < state.triangleCollisionDisabledUntil) {
+  const vertices = triangleVertices(arena, state.triangleRotation);
+
+  // The ball center has penetrated the triangle interior — usually because a
+  // fast (reactive) spin swept an edge across it between ticks, or a high-speed
+  // substep landed inside. Eject it out the NEAREST edge and bounce instead of
+  // letting it phase through (the old behaviour, which read as "the ball passed
+  // through the center piece").
+  if (pointInTriangle(state.ball, vertices[0], vertices[1], vertices[2])) {
+    let nearest: { closest: Vec2; distance: number } | undefined;
+    for (let index = 0; index < vertices.length; index += 1) {
+      const start = vertices[index];
+      const end = vertices[(index + 1) % vertices.length];
+      const closest = closestPointOnSegment(state.ball, start, end);
+      const distance = distanceVec(closest, state.ball);
+      if (!nearest || distance < nearest.distance) {
+        nearest = { closest, distance };
+      }
+    }
+
+    if (nearest) {
+      // Outward normal points from the interior ball toward the nearest edge.
+      const outward = subVec(nearest.closest, state.ball);
+      const normal = lengthSqVec(outward) > 0.0001
+        ? normalizeVecInPlace(outward)
+        : normalizeVecInPlace(subVec(state.ball, arena.center));
+      applyTriangleReactiveImpulse(state, arena, nearest.closest);
+      if (dotVec(state.velocity, normal) < 0) {
+        reflectBall(state, normal);
+      }
+      state.ball.x = nearest.closest.x + normal.x * (BALL_RADIUS + 0.5);
+      state.ball.y = nearest.closest.y + normal.y * (BALL_RADIUS + 0.5);
+      clearTouchState(state);
+      state.lastTouchType = "triangle";
+      events.push({ kind: "triangleHit" });
+    }
     return;
   }
 
@@ -473,9 +504,9 @@ function applyTriangleReactiveImpulse(state: SimState, arena: ArenaGeometry, con
   const lever = subVec(contact, arena.center);
   const incoming = state.velocity;
   const tangentPush = lever.x * incoming.y - lever.y * incoming.x;
-  const speedFactor = clamp(lengthVec(incoming) / MAX_BALL_SPEED, 0.28, 1.35);
+  const speedFactor = clamp(lengthVec(incoming) / MAX_BALL_SPEED, 0.28, 1.6);
   const direction = Math.sign(tangentPush) || Math.sign(state.triangleAngularVelocity) || 1;
-  const impulse = direction * clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.22, 1.18) * speedFactor * 2.2;
+  const impulse = direction * clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.3, 1.6) * speedFactor * 3.4;
   state.triangleAngularVelocity = clamp(
     state.triangleAngularVelocity + impulse,
     -TRIANGLE_REACTIVE_MAX_SPEED,
