@@ -1,6 +1,6 @@
 import Phaser from "phaser";
 import "./styles.css";
-import { TAU, type Vec2 } from "./sim/math";
+import { TAU, shortestAngleDelta, type Vec2 } from "./sim/math";
 import type {
   ArenaGeometry,
   BotDifficulty,
@@ -319,8 +319,10 @@ class FourPongScene extends Phaser.Scene {
   private rng: () => number = Math.random;
   private message = "Circular 4 Player is ready.";
   private themeId: ThemeId = "neon";
-  private musicVolume = 0.22;
-  private sfxVolume = 0.3;
+  private musicVolume = 0.02;
+  private sfxVolume = 0.05;
+  /** Eased camera spin that keeps the local player's side at screen-top. */
+  private currentViewRotation = 0;
   private paddleImpactBursts: PaddleImpactBurst[] = [];
   private ballTrail: BallTrailPoint[] = [];
   private confettiParticles: ConfettiParticle[] = [];
@@ -951,12 +953,59 @@ class FourPongScene extends Phaser.Scene {
     return this.players.find((player) => player.id === id);
   }
 
+  /**
+   * The view spin that puts the LOCAL player's home arc at screen-top (-PI/2),
+   * so that left/right always feel the same no matter which side of the circle
+   * you defend. Zero for offline play, spectators, the eliminated, and whoever
+   * already sits up top (slot 0) — those keep the default, un-rotated view.
+   */
+  private targetViewRotation(): number {
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return 0;
+    }
+    const me = this.players[net.slot];
+    if (!me || me.eliminated) {
+      return 0;
+    }
+    const homeCenter = me.arcStart + (me.arcEnd - me.arcStart) / 2;
+    // Rotation R such that homeCenter renders at screen-top: homeCenter + R = -PI/2.
+    return shortestAngleDelta(homeCenter, -Math.PI / 2);
+  }
+
+  /**
+   * Ease the camera toward {@link targetViewRotation} and pivot it about the
+   * arena centre (Phaser rotates a camera around its own midpoint, so we park
+   * the arena centre there via scroll). Re-orienting on elimination glides
+   * instead of snapping.
+   */
+  private applyViewTransform(arena: ArenaGeometry) {
+    const target = this.targetViewRotation();
+    const delta = shortestAngleDelta(this.currentViewRotation, target);
+    this.currentViewRotation = Math.abs(delta) < 0.0008 ? target : this.currentViewRotation + delta * 0.18;
+
+    const cam = this.cameras.main;
+    if (Math.abs(shortestAngleDelta(this.currentViewRotation, 0)) < 0.0008) {
+      this.currentViewRotation = 0;
+      cam.setRotation(0);
+      cam.setScroll(0, 0);
+      return;
+    }
+    cam.setScroll(arena.center.x - this.scale.width / 2, arena.center.y - this.scale.height / 2);
+    cam.setRotation(this.currentViewRotation);
+  }
+
   private renderArena() {
     const width = this.scale.width;
     const height = this.scale.height;
     const arena = this.arena();
     const theme = this.activeTheme();
 
+    this.applyViewTransform(arena);
+
+    // Fill behind the (possibly rotated) world so the viewport corners never
+    // show through once the camera spins.
+    this.cameras.main.setBackgroundColor(theme.background);
     this.gfx.clear();
     this.gfx.fillStyle(theme.background, 1);
     this.gfx.fillRect(0, 0, width, height);

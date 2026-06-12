@@ -356,7 +356,7 @@ function resetRoundInternal(state: SimState, arena: ArenaGeometry, rng: Rng, eve
 export function advanceBall(state: SimState, arena: ArenaGeometry, dt: number, catchHeld: boolean, rng: Rng): SimEvent[] {
   const events: SimEvent[] = [];
   const distance = lengthVec(state.velocity) * dt;
-  const steps = Math.max(1, Math.ceil(distance / (BALL_RADIUS * 0.65)));
+  const steps = Math.max(1, Math.ceil(distance / (BALL_RADIUS * 0.5)));
   const stepDt = dt / steps;
 
   for (let index = 0; index < steps; index += 1) {
@@ -553,7 +553,11 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
       return;
     }
 
-    if (dotVec(state.velocity, roundedNormal) < 0 || hit.crossed) {
+    // Reflect when the ball is heading into the paddle face, when it tunnelled
+    // across it this substep, OR whenever it is travelling outward toward the
+    // goal — a keeper paddle must turn back anything moving past it, even a
+    // glancing/tangential touch that would otherwise slip through the edges.
+    if (dotVec(state.velocity, roundedNormal) < 0 || hit.crossed || dotVec(state.velocity, hit.radial) > 0) {
       reflectBall(state, roundedNormal);
     }
 
@@ -562,8 +566,14 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
     }
     state.lastTouchType = "player";
     state.lastTouchPlayerId = player.id;
-    state.ball.x = hit.contact.x + roundedNormal.x * (BALL_RADIUS + PADDLE_RELEASE_GAP);
-    state.ball.y = hit.contact.y + roundedNormal.y * (BALL_RADIUS + PADDLE_RELEASE_GAP);
+    // Always settle the ball on the centre-facing side of the paddle. If the
+    // curve-adjusted normal points outward (a wing/edge contact), push along the
+    // inward radial instead so the ball can never be nudged into the goal.
+    const releaseNormal = dotVec(roundedNormal, hit.radial) > 0
+      ? { x: -hit.radial.x, y: -hit.radial.y }
+      : roundedNormal;
+    state.ball.x = hit.contact.x + releaseNormal.x * (BALL_RADIUS + PADDLE_RELEASE_GAP);
+    state.ball.y = hit.contact.y + releaseNormal.y * (BALL_RADIUS + PADDLE_RELEASE_GAP);
     return;
   }
 }
