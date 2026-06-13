@@ -159,6 +159,25 @@ body {
   opacity: 0.46;
 }
 
+/* "Your" card — so the player can find their own lives at a glance. */
+.score-card.is-self {
+  border-color: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28), 0 0 18px rgba(255, 255, 255, 0.12),
+    0 10px 30px rgba(0, 0, 0, 0.28);
+}
+
+.you-tag {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 0.56rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+
 .name {
   display: block;
   margin-bottom: 8px;
@@ -176,8 +195,8 @@ body {
 }
 
 .pip {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
@@ -190,21 +209,57 @@ body {
 }
 
 .charge-meter {
+  position: relative;
   display: block;
   width: 100%;
-  height: 5px;
+  height: 9px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.11);
 }
 
-.charge-meter span {
+.charge-fill {
   display: block;
   width: calc(var(--charge) * 100%);
   height: 100%;
   border-radius: inherit;
   background: var(--player-color);
   box-shadow: 0 0 12px var(--player-color);
+  transition: width 0.12s ease-out;
+}
+
+/* "SUPER" caption sits over the bar; only revealed once the super is ready. */
+.charge-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.5rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: #0a0f14;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.charge-meter.ready {
+  background: var(--player-color);
+  animation: charge-ready-pulse 0.9s ease-in-out infinite;
+}
+
+.charge-meter.ready .charge-label {
+  opacity: 0.92;
+}
+
+@keyframes charge-ready-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 8px var(--player-color);
+  }
+  50% {
+    box-shadow: 0 0 20px var(--player-color);
+  }
 }
 
 .status-chip,

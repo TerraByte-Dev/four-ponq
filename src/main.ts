@@ -73,6 +73,8 @@ interface HudState {
   sfxVolume: number;
   /** The local player's chosen display name (sent to the server as our name). */
   playerName: string;
+  /** Index of THIS client's player among `players` (-1 if spectating). Marks "your" card. */
+  localSlot: number;
   /**
    * True while the ONLINE session screens (spectator banner / ready panel /
    * countdown) own the overlay layer — the legacy offline menu card stays
@@ -191,6 +193,12 @@ const WIN_FANFARE_KEYS = [
   "win-fanfare-02",
   "win-fanfare-03"
 ] as const;
+// A player can grab/launch ("super") on their next face hit once their visible
+// charge reaches this. addCharge() bumps +1 before the catch check, so the
+// effective "ready" charge entering a hit is MAX_CHARGE - 1; the HUD meter and
+// the in-arena glow both treat this value as "full / ready".
+const CHARGE_READY_AT = Math.max(1, MAX_CHARGE - 1);
+
 const MUSIC_TRACKS = [
   {
     key: "music-round-01",
@@ -409,6 +417,15 @@ class FourPongScene extends Phaser.Scene {
     this.sim.triangleMotionMode = value;
   }
 
+  /**
+   * Render-facing index of the LOCAL player among this.players: slot 0 offline
+   * (the lone human), the net seat online, -1 for spectators. Used to mark
+   * "your" HUD card and draw the charge-ready glow on your own paddle.
+   */
+  private localSlot(): number {
+    return this.networked ? (this.net?.slot ?? -1) : 0;
+  }
+
   preload() {
     const clonkFiles = [
       "01-hollow-clonk-pitch-0.920.wav",
@@ -587,7 +604,34 @@ class FourPongScene extends Phaser.Scene {
       this.botFill = net.botFill;
     }
 
+    this.pushArcadeRoster();
     this.emitHud();
+  }
+
+  /**
+   * Mirror the live room roster into the arcade HOME overlay's P1-P4 strip
+   * (names, bot tags, "(you)", and "Open" placeholders for empty seats). When
+   * we're not on the server (offline local hot-seat) we clear it back to
+   * placeholders. The overlay is injected by the hub and absent in local dev,
+   * so guard every call.
+   */
+  private pushArcadeRoster() {
+    const overlay = window.__arcadeHome ?? window.__arcadeHomeOverlay;
+    if (!overlay || typeof overlay.setPlayers !== "function") return;
+    const net = this.net;
+    if (!net || net.state !== "open") {
+      overlay.clearPlayers?.();
+      return;
+    }
+    overlay.setPlayers(
+      net.players.map((p) => ({
+        slot: p.slot,
+        name: p.name,
+        connected: p.connected,
+        isBot: p.isBot,
+        you: p.slot === net.slot
+      }))
+    );
   }
 
   /** Human-readable lobby line: "Connected as P2 · 3 players · waiting". */
@@ -1052,6 +1096,7 @@ class FourPongScene extends Phaser.Scene {
     this.drawPlayerArcs(arena);
     this.drawTriangle(arena, theme);
     this.drawPaddles(arena);
+    this.drawChargeGlow(arena);
     this.drawSeatFlash(arena);
     this.drawBallTrail(theme);
     this.drawServeIndicator(theme);
@@ -1114,6 +1159,30 @@ class FourPongScene extends Phaser.Scene {
       this.gfx.fillPath();
       this.gfx.strokePath();
     }
+  }
+
+  /**
+   * Pulsing halo around the LOCAL player's paddle while their super is ready to
+   * grab (charge >= CHARGE_READY_AT). Answers the "I barely know when my super
+   * is charged" feedback at a glance, right where the player is already looking.
+   * World-space so it tracks the per-client view rotation.
+   */
+  private drawChargeGlow(arena: ArenaGeometry) {
+    const slot = this.localSlot();
+    if (slot < 0) {
+      return;
+    }
+    const player = this.players[slot];
+    if (!player || player.eliminated || player.charge < CHARGE_READY_AT) {
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.012);
+    const pos = paddleCenter(arena, player);
+    this.gfx.lineStyle(3, 0xffffff, 0.22 + 0.4 * pulse);
+    this.gfx.strokeCircle(pos.x, pos.y, 22 + pulse * 7);
+    this.gfx.lineStyle(6, player.color, 0.28 + 0.5 * pulse);
+    this.gfx.strokeCircle(pos.x, pos.y, 34 + pulse * 9);
   }
 
   /**
@@ -1783,6 +1852,7 @@ class FourPongScene extends Phaser.Scene {
       musicVolume: this.musicVolume,
       sfxVolume: this.sfxVolume,
       playerName: this.playerName,
+      localSlot: this.localSlot(),
       netSession: this.networked && this.mode !== "paused"
     };
 
@@ -1941,17 +2011,22 @@ const sessionCountdownHint = document.querySelector<HTMLSpanElement>("#session-c
 
 window.addEventListener("four-pong:hud", (event) => {
   const state = (event as CustomEvent<HudState>).detail;
-  scoreStrip.innerHTML = state.players.map((player) => {
-    const shields = Array.from({ length: MAX_SHIELDS }, (_, index) => {
-      const live = index < player.shields;
+  scoreStrip.innerHTML = state.players.map((player, index) => {
+    const shields = Array.from({ length: MAX_SHIELDS }, (_, i) => {
+      const live = i < player.shields;
       return `<span class="pip ${live ? "live" : ""}" style="--player-color: ${player.cssColor}"></span>`;
     }).join("");
-    const charge = Phaser.Math.Clamp(player.charge / MAX_CHARGE, 0, 1);
-    return `<article class="score-card ${player.eliminated ? "out" : ""}">
-      <span class="name" style="--player-color: ${player.cssColor}">${escapeHtml(player.name)}</span>
+    // Fill the meter against the *ready* threshold so a full bar literally means
+    // "your super is ready" (see CHARGE_READY_AT).
+    const charge = Phaser.Math.Clamp(player.charge / CHARGE_READY_AT, 0, 1);
+    const ready = player.charge >= CHARGE_READY_AT;
+    const isSelf = index === state.localSlot;
+    return `<article class="score-card ${player.eliminated ? "out" : ""} ${isSelf ? "is-self" : ""}">
+      <span class="name" style="--player-color: ${player.cssColor}">${escapeHtml(player.name)}${isSelf ? '<span class="you-tag">you</span>' : ""}</span>
       <span class="pips">${shields}</span>
-      <span class="charge-meter" aria-label="${player.name} charge ${player.charge} of ${MAX_CHARGE}">
-        <span style="--player-color: ${player.cssColor}; --charge: ${charge}"></span>
+      <span class="charge-meter ${ready ? "ready" : ""}" style="--player-color: ${player.cssColor}" aria-label="${player.name} super ${ready ? "ready" : `charging ${player.charge} of ${CHARGE_READY_AT}`}">
+        <span class="charge-fill" style="--charge: ${charge}"></span>
+        <span class="charge-label">SUPER</span>
       </span>
     </article>`;
   }).join("");

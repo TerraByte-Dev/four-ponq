@@ -553,11 +553,13 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
       return;
     }
 
-    // Reflect when the ball is heading into the paddle face, when it tunnelled
-    // across it this substep, OR whenever it is travelling outward toward the
-    // goal — a keeper paddle must turn back anything moving past it, even a
-    // glancing/tangential touch that would otherwise slip through the edges.
-    if (dotVec(state.velocity, roundedNormal) < 0 || hit.crossed || dotVec(state.velocity, hit.radial) > 0) {
+    // Reflect when the ball is heading into the paddle face, or when it tunnelled
+    // across the face this substep. We no longer reflect "anything moving
+    // outward": with the back arc excluded from the hit test the only contacts
+    // left are the inner cup, and that clause was what bounced balls off empty
+    // space beside the paddle. A ball that beats an out-of-position paddle to an
+    // undefended part of the arc is supposed to score — that's the game.
+    if (dotVec(state.velocity, roundedNormal) < 0 || hit.crossed) {
       reflectBall(state, roundedNormal);
     }
 
@@ -583,6 +585,7 @@ function paddleHitTest(state: SimState, arena: ArenaGeometry, player: SimPlayer,
   const radial = normalizeVecInPlace(subVec(center, arena.center));
   const tangent = { x: -radial.y, y: radial.x };
   const segments = paddleCollisionSegments(arena, player);
+  const halfHeight = paddleHalfHeight(arena);
   let best:
     | {
       contact: Vec2;
@@ -593,6 +596,13 @@ function paddleHitTest(state: SimState, arena: ArenaGeometry, player: SimPlayer,
 
   for (const segment of segments) {
     const contact = closestPointOnSegment(state.ball, segment.start, segment.end);
+    // Only the inner "cup" (concave face + wing flanks) plays the ball. Contacts
+    // on the convex BACK — the arc that sits out on the goal ring — must never
+    // reflect; bouncing off it is what read as "the ball bounces in front of /
+    // beside the paddle, not off it".
+    if (dotVec(subVec(contact, center), radial) > halfHeight * 0.5) {
+      continue;
+    }
     const distance = distanceVec(contact, state.ball);
     if (!best || distance < best.distance) {
       best = { contact, distance, offset: segment.offset };
@@ -600,11 +610,12 @@ function paddleHitTest(state: SimState, arena: ArenaGeometry, player: SimPlayer,
   }
 
   if (best && best.distance <= BALL_RADIUS) {
-    const normal = paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-    const separation = subVec(state.ball, best.contact);
     return {
       contact: best.contact,
-      normal: lengthSqVec(separation) > 0.0001 ? normalizeVecInPlace(separation) : normal,
+      // Reflect along the true inward face normal, not the ball→contact
+      // separation (which degenerates to a tangential/outward vector on edge
+      // contacts and let real face hits slip through the early-out).
+      normal: paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial),
       radial,
       offset: best.offset,
       penetration: BALL_RADIUS - best.distance,
@@ -641,9 +652,14 @@ function paddleSweptHitTest(
     }
     | undefined;
 
+  const halfHeight = paddleHalfHeight(arena);
   for (const segment of segments) {
     const closest = closestPointsBetweenSegments(previousBall, state.ball, segment.start, segment.end);
     if (closest.distance > BALL_RADIUS) {
+      continue;
+    }
+    // Same back-arc exclusion as the static test (see paddleHitTest).
+    if (dotVec(subVec(closest.b, center), radial) > halfHeight * 0.5) {
       continue;
     }
 
@@ -660,12 +676,9 @@ function paddleSweptHitTest(
     return undefined;
   }
 
-  const separation = subVec(state.ball, best.contact);
-  const normal = paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-
   return {
     contact: best.contact,
-    normal: lengthSqVec(separation) > 0.0001 ? normalizeVecInPlace(separation) : normal,
+    normal: paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial),
     radial,
     offset: best.offset,
     penetration: BALL_RADIUS - best.distance,
