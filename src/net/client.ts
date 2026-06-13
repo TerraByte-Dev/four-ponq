@@ -22,6 +22,7 @@
 
 import type { ClientMsg, ServerMsg, PlayerView, RoomMode } from "../../shared/protocol";
 import { SNAP_HZ, MAX_PLAYERS, COUNTDOWN_SECONDS } from "../../shared/protocol";
+import type { BotDifficulty, GameVariant, TriangleMotionMode } from "../sim/types";
 import { TAU } from "../sim/math";
 
 // Re-export the session-layer types/constants main.ts needs so the scene keeps
@@ -104,6 +105,12 @@ export class NetClient {
   private _players: PlayerView[] = [];
   private _mode: RoomMode = "lobby";
   private _botFill = true;
+  /** Host = lowest-slot connected human (server-derived); -1 if room empty. */
+  private _hostSlot = -1;
+  /** Authoritative shared gameplay settings (mirrored from {t:"room"}). */
+  private _difficulty: BotDifficulty = "medium";
+  private _gameVariant: GameVariant = "classic";
+  private _triangleMotion: TriangleMotionMode = "steady";
   /** Seconds remaining in the ready-screen countdown (mode === "countdown" only). */
   private _countdown: number | undefined;
   /** True between {t:"joinPending"} and the deferred {t:"seated"} at next serve. */
@@ -206,6 +213,11 @@ export class NetClient {
     this.send({ t: "setBots", on });
   }
 
+  /** Host-only shared gameplay setting change (server enforces host + ready-screen). */
+  sendSetting(key: "difficulty" | "gameVariant" | "triangleMotion", value: string): void {
+    this.send({ t: "setSetting", key, value });
+  }
+
   private send(msg: ClientMsg): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
@@ -237,6 +249,10 @@ export class NetClient {
         this._players = msg.players;
         this._mode = msg.mode;
         this._botFill = msg.botFill;
+        this._hostSlot = msg.hostSlot;
+        this._difficulty = msg.difficulty;
+        this._gameVariant = msg.gameVariant;
+        this._triangleMotion = msg.triangleMotion;
         this._countdown = msg.mode === "countdown" ? msg.countdown : undefined;
         this.opts.onChange?.();
         break;
@@ -429,6 +445,23 @@ export class NetClient {
   }
   get botFill(): boolean {
     return this._botFill;
+  }
+  /** Slot of the current host (lowest-slot human); -1 if none. */
+  get hostSlot(): number {
+    return this._hostSlot;
+  }
+  /** True when WE are the host (our seat is the host seat). */
+  get isHost(): boolean {
+    return this._slot >= 0 && this._slot === this._hostSlot;
+  }
+  get difficulty(): BotDifficulty {
+    return this._difficulty;
+  }
+  get gameVariant(): GameVariant {
+    return this._gameVariant;
+  }
+  get triangleMotion(): TriangleMotionMode {
+    return this._triangleMotion;
   }
   /** Seconds left in the 3-2-1 (only meaningful while mode === "countdown"). */
   get countdown(): number | undefined {

@@ -948,6 +948,76 @@ body.arcade-home-active #session-overlay {
   text-align: center;
 }
 
+/* Host-controlled rule chips on the ready panel. */
+.session-settings {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 6px;
+}
+
+.session-settings-label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.session-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-setting-name {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.session-setting-options {
+  display: flex;
+  gap: 4px;
+}
+
+.session-setting-options button {
+  min-height: 28px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.session-setting-options button:hover:not(:disabled) {
+  border-color: var(--cool);
+}
+
+.session-setting-options button.active {
+  color: #031018;
+  background: var(--cool);
+  border-color: var(--cool);
+}
+
+.session-setting-options button:disabled {
+  cursor: default;
+}
+
+/* Non-host: rules are read-only chips — dim the options the host didn't pick. */
+.session-settings.readonly .session-setting-options button:disabled:not(.active) {
+  opacity: 0.4;
+}
+
 .session-countdown {
   display: grid;
   place-items: center;

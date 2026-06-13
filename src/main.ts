@@ -114,6 +114,13 @@ interface SessionUiState {
   countdown: number | null;
   /** Seated players get the "Space — cancel" hint under the countdown. */
   seated: boolean;
+  /** True when WE are the host — host gets interactive rule controls; others read-only. */
+  isHost: boolean;
+  /** Authoritative shared gameplay settings, shown on the ready panel. */
+  difficulty: BotDifficulty;
+  gameVariant: GameVariant;
+  triangleMotion: TriangleMotionMode;
+  botFill: boolean;
 }
 
 interface PaddleImpactBurst {
@@ -601,7 +608,13 @@ class FourPongScene extends Phaser.Scene {
       }
       this.netStatus = this.describeRoom(net);
       this.message = this.netStatus;
+      // Mirror the server's authoritative shared settings onto the local sim so
+      // the renderer/HUD (triangle spin, arena rotation, CPU label) match what
+      // the server is actually running. The host sets these; everyone reflects.
       this.botFill = net.botFill;
+      this.botDifficulty = net.difficulty;
+      this.gameVariant = net.gameVariant;
+      this.triangleMotionMode = net.triangleMotion;
     }
 
     this.pushArcadeRoster();
@@ -1545,10 +1558,28 @@ class FourPongScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * Networked gameplay settings are HOST-ONLY and server-authoritative: only the
+   * host (lowest-slot human, "P1") may change them, and only on a ready screen.
+   * We route the change to the server and let the {t:"room"} echo apply it (so
+   * every client agrees); offline keeps the original local mutation.
+   */
+  private rejectNonHostSetting(): boolean {
+    if (this.networked && this.net && !this.net.isHost) {
+      this.message = "Only the host (P1) sets the rules.";
+      this.emitHud();
+      return true;
+    }
+    return false;
+  }
+
   private toggleBotFill() {
-    // Networked: bot-fill is a server setting; ask the server to flip it and
-    // let the next {t:"room"} echo it back. Don't mutate local sim state.
+    // Networked: bot-fill is a host-only server setting; ask the server to flip
+    // it and let the next {t:"room"} echo it back. Don't mutate local sim state.
     if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
       this.net.sendSetBots(!this.net.botFill);
       return;
     }
@@ -1559,18 +1590,33 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private setBotDifficulty(difficulty: BotDifficulty) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("difficulty", difficulty);
+      return;
+    }
     this.botDifficulty = difficulty;
     this.message = `Computer difficulty set to ${difficulty}.`;
     this.emitHud();
   }
 
   private setGameVariant(variant: GameVariant) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("gameVariant", variant);
+      return;
+    }
     this.gameVariant = variant;
     this.message = variant === "rotating" ? "Orbit mode on. The whole circle rotates clockwise." : "Classic mode on. The arena holds steady.";
     this.emitHud();
   }
 
   private setTheme(themeId: ThemeId) {
+    // Theme is a per-client cosmetic preference — always local, never host-locked.
     this.themeId = themeId;
     this.applyPlayerTheme();
     this.message = `Theme set to ${this.activeTheme().name}.`;
@@ -1578,6 +1624,13 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private setTriangleMotionMode(mode: TriangleMotionMode) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("triangleMotion", mode);
+      return;
+    }
     this.triangleMotionMode = mode;
     if (mode === "steady") {
       this.sim.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
@@ -1877,7 +1930,12 @@ class FourPongScene extends Phaser.Scene {
       selfReady: false,
       waitingFor: 0,
       countdown: null,
-      seated: false
+      seated: false,
+      isHost: false,
+      difficulty: this.botDifficulty,
+      gameVariant: this.gameVariant,
+      triangleMotion: this.triangleMotionMode,
+      botFill: this.botFill
     };
 
     if (this.networked && net && net.state === "open" && this.mode !== "paused") {
@@ -1893,6 +1951,11 @@ class FourPongScene extends Phaser.Scene {
 
       if (net.slot >= 0 && (net.mode === "lobby" || net.mode === "matchOver")) {
         state.showReady = true;
+        state.isHost = net.isHost;
+        state.difficulty = net.difficulty;
+        state.gameVariant = net.gameVariant;
+        state.triangleMotion = net.triangleMotion;
+        state.botFill = net.botFill;
         state.matchOver = net.mode === "matchOver";
         state.resultLine = state.matchOver ? this.lastResultLine || "Match over." : "";
         state.rows = [...net.players]
@@ -1985,6 +2048,37 @@ document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
       <span class="mode-kicker" id="session-kicker">Online lobby</span>
       <h2 id="session-result" hidden></h2>
       <ul id="session-roster"></ul>
+      <div class="session-settings" id="session-settings">
+        <span class="session-settings-label" id="session-settings-label">Rules</span>
+        <div class="session-setting">
+          <span class="session-setting-name">CPU</span>
+          <div class="session-setting-options" data-setting="difficulty">
+            <button type="button" data-difficulty="easy">Easy</button>
+            <button type="button" data-difficulty="medium">Medium</button>
+            <button type="button" data-difficulty="hard">Hard</button>
+          </div>
+        </div>
+        <div class="session-setting">
+          <span class="session-setting-name">Mode</span>
+          <div class="session-setting-options" data-setting="gameVariant">
+            <button type="button" data-game-variant="classic">Classic</button>
+            <button type="button" data-game-variant="rotating">Orbit</button>
+          </div>
+        </div>
+        <div class="session-setting">
+          <span class="session-setting-name">Triangle</span>
+          <div class="session-setting-options" data-setting="triangleMotion">
+            <button type="button" data-triangle-motion="steady">Steady</button>
+            <button type="button" data-triangle-motion="reactive">Reactive</button>
+          </div>
+        </div>
+        <div class="session-setting">
+          <span class="session-setting-name">Bots</span>
+          <div class="session-setting-options">
+            <button type="button" id="session-bots-button">Bots: On</button>
+          </div>
+        </div>
+      </div>
       <button id="session-ready-button" type="button">Ready (Space)</button>
       <p id="session-status">Press Space when you're ready.</p>
     </div>
@@ -2005,6 +2099,9 @@ const sessionResult = document.querySelector<HTMLHeadingElement>("#session-resul
 const sessionRoster = document.querySelector<HTMLUListElement>("#session-roster")!;
 const sessionReadyButton = document.querySelector<HTMLButtonElement>("#session-ready-button")!;
 const sessionStatus = document.querySelector<HTMLParagraphElement>("#session-status")!;
+const sessionSettings = document.querySelector<HTMLDivElement>("#session-settings")!;
+const sessionSettingsLabel = document.querySelector<HTMLSpanElement>("#session-settings-label")!;
+const sessionBotsButton = document.querySelector<HTMLButtonElement>("#session-bots-button")!;
 const sessionCountdown = document.querySelector<HTMLDivElement>("#session-countdown")!;
 const sessionCountdownNumber = document.querySelector<HTMLSpanElement>("#session-countdown-number")!;
 const sessionCountdownHint = document.querySelector<HTMLSpanElement>("#session-countdown-hint")!;
@@ -2133,6 +2230,24 @@ window.addEventListener("four-pong:session", (event) => {
       : s.waitingFor > 0
         ? `Waiting for ${s.waitingFor} more player${s.waitingFor === 1 ? "" : "s"}…`
         : "All set — starting…";
+
+    // Rules controls: highlight the current value; the host gets interactive
+    // buttons, everyone else sees them as read-only chips.
+    const markSetting = (key: string, current: string) => {
+      sessionSettings.querySelectorAll<HTMLButtonElement>(`[data-setting="${key}"] button`).forEach((btn) => {
+        const val = btn.dataset.difficulty ?? btn.dataset.gameVariant ?? btn.dataset.triangleMotion ?? "";
+        btn.classList.toggle("active", val === current);
+        btn.disabled = !s.isHost;
+      });
+    };
+    markSetting("difficulty", s.difficulty);
+    markSetting("gameVariant", s.gameVariant);
+    markSetting("triangleMotion", s.triangleMotion);
+    sessionBotsButton.textContent = `Bots: ${s.botFill ? "On" : "Off"}`;
+    sessionBotsButton.classList.toggle("active", s.botFill);
+    sessionBotsButton.disabled = !s.isHost;
+    sessionSettingsLabel.textContent = s.isHost ? "Rules — you're the host" : "Rules — host (P1) sets them";
+    sessionSettings.classList.toggle("readonly", !s.isHost);
   }
 
   if (s.countdown !== null) {
@@ -2156,6 +2271,40 @@ sessionJoinButton.addEventListener("click", () => {
 sessionReadyButton.addEventListener("click", () => {
   window.dispatchEvent(new Event("four-pong:ready-toggle"));
   sessionReadyButton.blur(); // Space must hit the window handler, not this button
+});
+
+// Ready-panel rule controls reuse the SAME four-pong:set-* events as the offline
+// menu; the scene's setters host-gate + route them to the server when networked.
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-difficulty]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.difficulty;
+    if (v === "easy" || v === "medium" || v === "hard") {
+      window.dispatchEvent(new CustomEvent<BotDifficulty>("four-pong:set-difficulty", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-game-variant]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.gameVariant;
+    if (v === "classic" || v === "rotating") {
+      window.dispatchEvent(new CustomEvent<GameVariant>("four-pong:set-game-variant", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-triangle-motion]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.triangleMotion;
+    if (v === "steady" || v === "reactive") {
+      window.dispatchEvent(new CustomEvent<TriangleMotionMode>("four-pong:set-triangle-motion", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionBotsButton.addEventListener("click", () => {
+  window.dispatchEvent(new Event("four-pong:toggle-bots"));
+  sessionBotsButton.blur();
 });
 
 startButton.addEventListener("click", () => {

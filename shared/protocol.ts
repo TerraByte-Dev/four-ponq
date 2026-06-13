@@ -27,6 +27,10 @@
  *   - {t:"start"} is a legacy alias for {t:"ready", on:true}.
  */
 
+// Gameplay-setting value unions, shared verbatim with the sim. Type-only import
+// (compiles away) — keeps protocol.ts runtime-dependency-free for both tsconfigs.
+import type { BotDifficulty, GameVariant, TriangleMotionMode } from "../src/sim/types";
+
 /** Server simulation steps per second. */
 export const SIM_HZ = 60;
 
@@ -56,8 +60,14 @@ export type ClientMsg =
   | { t: "ready"; on: boolean }
   /** Legacy alias for { t:"ready", on:true }. */
   | { t: "start" }
-  /** Toggle bot-fill for empty slots. */
-  | { t: "setBots"; on: boolean };
+  /** Toggle bot-fill for empty slots. Host-only + ready-screen-only (server-enforced). */
+  | { t: "setBots"; on: boolean }
+  /**
+   * Host-only, ready-screen-only change to a shared gameplay setting. The server
+   * applies it to the authoritative sim and echoes the value back in {t:"room"}.
+   * (Theme is intentionally absent — it stays a per-client cosmetic preference.)
+   */
+  | { t: "setSetting"; key: "difficulty" | "gameVariant" | "triangleMotion"; value: string };
 
 // ---------------------------------------------------------------------------
 // Shared view types
@@ -106,6 +116,12 @@ export type ServerMsg =
       players: PlayerView[];
       mode: RoomMode;
       botFill: boolean;
+      /** Slot of the current host (lowest-slot connected human); -1 if room empty. */
+      hostSlot: number;
+      /** Authoritative shared gameplay settings, so every client agrees + can display them. */
+      difficulty: BotDifficulty;
+      gameVariant: GameVariant;
+      triangleMotion: TriangleMotionMode;
       countdown?: number;
     }
   /** Join acknowledged but deferred — you'll be seated at the next serve. */

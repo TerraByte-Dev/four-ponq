@@ -40,10 +40,13 @@ import {
 } from "../shared/protocol";
 import type {
   ArenaGeometry,
+  BotDifficulty,
+  GameVariant,
   PlayerInput,
   SimEvent,
   SimPlayer,
-  SimState
+  SimState,
+  TriangleMotionMode
 } from "../src/sim/types";
 import {
   BASE_PADDLE_SPEED,
@@ -498,9 +501,52 @@ export class Room {
     this.sim.velocity.y = 0;
   }
 
-  /** Toggle bot-fill for empty slots; echoes the new state via {room}. */
-  setBots(on: boolean): void {
+  // --- host-controlled settings ---------------------------------------------
+
+  /** Slot of the current host = lowest-slot connected human (-1 if none). Derived,
+   *  never cached, so it auto-reassigns when the host leaves or a lower slot fills. */
+  private hostSlot(): number {
+    return this.slots.findIndex((s) => s.clientId !== null);
+  }
+
+  /** True when this client is the current host. */
+  private isHost(clientId: string): boolean {
+    const h = this.hostSlot();
+    return h >= 0 && this.slots[h].clientId === clientId;
+  }
+
+  /** Accept a host-only setting change only on a ready screen (lobby/matchOver). */
+  private canChangeSettings(clientId: string): boolean {
+    return (this.roomMode === "lobby" || this.roomMode === "matchOver") && this.isHost(clientId);
+  }
+
+  /** Toggle bot-fill for empty slots; host-only + ready-screen-only. Echoes via {room}. */
+  setBots(clientId: string, on: boolean): void {
+    if (!this.canChangeSettings(clientId)) {
+      return;
+    }
     this.sim.botFill = !!on;
+    this.broadcastRoom();
+  }
+
+  /**
+   * Host changes a shared gameplay setting on the ready screen. Applied to the
+   * authoritative sim immediately (beginMatch reads it live at the next start)
+   * and echoed to every client via {room}. Non-hosts / mid-match are ignored.
+   */
+  setSetting(clientId: string, key: string, value: string): void {
+    if (!this.canChangeSettings(clientId)) {
+      return;
+    }
+    if (key === "difficulty" && (value === "easy" || value === "medium" || value === "hard")) {
+      this.sim.botDifficulty = value;
+    } else if (key === "gameVariant" && (value === "classic" || value === "rotating")) {
+      this.sim.gameVariant = value;
+    } else if (key === "triangleMotion" && (value === "steady" || value === "reactive")) {
+      this.sim.triangleMotionMode = value;
+    } else {
+      return; // unknown key/value — ignore, don't broadcast
+    }
     this.broadcastRoom();
   }
 
@@ -788,7 +834,11 @@ export class Room {
       t: "room",
       players,
       mode: this.roomMode,
-      botFill: this.sim.botFill
+      botFill: this.sim.botFill,
+      hostSlot: this.hostSlot(),
+      difficulty: this.sim.botDifficulty,
+      gameVariant: this.sim.gameVariant,
+      triangleMotion: this.sim.triangleMotionMode
     };
     if (this.roomMode === "countdown") {
       msg.countdown = this.countdownLeft;

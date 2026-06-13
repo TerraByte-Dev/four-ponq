@@ -294,7 +294,12 @@ wss.on("connection", (ws: WebSocket) => {
       }
       case "setBots": {
         if (!joined) return;
-        room.setBots(!!msg.on);
+        room.setBots(clientId, !!msg.on);
+        break;
+      }
+      case "setSetting": {
+        if (!joined) return;
+        room.setSetting(clientId, msg.key, typeof msg.value === "string" ? msg.value : "");
         break;
       }
       default: {
