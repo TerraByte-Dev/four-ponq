@@ -5,10 +5,24 @@ four-ponq is now a graduated, networked arcade game._
 
 ## TL;DR for next session
 
-**Top priority:** four-ponq loads to the **offline menu** (Play/Settings, Start,
-Bot fill) instead of the ring + ready-up screen. The origin is verified healthy —
-this is browser/edge-side (stale cache or WS not connecting). See **OPEN ISSUE**
-below; start there. Then the older music feedback (Feedback.md) is still open.
+**ALWAYS pull the live Wii-hub feedback FIRST — it is the canonical to-do list,
+NOT this repo's `Feedback.md` (which is a stale, separate channel).**
+`node <workshop>/scripts/feedback.mjs four-ponq` (or
+`ssh terrabyte@192.168.1.207 'docker exec arcade-api cat /data/feedback.ndjson'`
+and filter `gameId=four-ponq`).
+
+**Session 2026-06-13 shipped all 3 live hub-feedback items in two deploys — both
+LIVE + committed/pushed to `mine` (`53352f6` paddle/UI, `30384c7` host-settings):**
+1. **Paddle physics "not physicing"** → real collision bugs fixed (see Round 1).
+2. **"Can't tell when my super is charged" + can't find own lives** → charge-ready
+   indicator + self-marked HUD card (Round 1).
+3. **"No way to change game settings without losing"** → host-controlled settings
+   on the ready screen (Round 2).
+
+**"Boots to the offline menu" (the old top priority) appears resolved:** a clean
+client on the fresh build connects straight into the lobby (verified headless),
+and the two redeploys changed the bundle hash, busting any stale cached
+`index.html`. If a user still reports it, it's browser cache — hard-refresh.
 
 ## Where it lives / stack
 
@@ -57,7 +71,12 @@ Verify: `docker ps --filter name=four-ponq`; on the box
 → 302 (Access redirect). Reload Caddy ONLY if the Caddyfile changed:
 `docker exec caddy caddy reload --config /etc/caddy/Caddyfile`.
 
-## OPEN ISSUE (do this first) — boots to offline menu, not ring/ready
+## RESOLVED 2026-06-13 — "boots to offline menu" (diagnosis kept for reference)
+
+**Resolution:** a clean client on the post-Round-1/2 build connects straight into
+the lobby (verified headless), and the two redeploys changed the bundle hash —
+busting any stale cached `index.html`. Treat any recurrence as browser cache
+(hard-refresh / clear site data). The original diagnosis is retained below.
 
 **Symptom (user-reported 2026-06-12):** page shows the legacy menu card
 (Play/Settings tabs, Start, "Bot Fill: On") instead of the four-ponq ring with
@@ -94,7 +113,40 @@ the **WS failing through Cloudflare/Access** for that session.
    `menuOverlay.hidden = mode === "playing" || netSession`, where
    `netSession = networked && mode !== "paused"`.
 
-## Done & deployed this session (all on `feat/arcade-home-and-scale`, pushed `mine`)
+## Done & deployed 2026-06-13 (this session) — Rounds 1 & 2
+
+Both LIVE, committed, pushed to `mine`. `src/sim/*` is shared by the server, so
+physics changes are server-authoritative (ship to everyone — hence the test).
+
+**Round 1 — paddle physics + charge/lives HUD (`53352f6`):**
+- Collisions reflect ONLY off the inner cup (concave face + wings); the convex
+  back arc on the goal ring no longer bounces balls in empty space, and hits use
+  the true inward face normal (was the ball→contact separation, which degenerated
+  on edges and let face shots tunnel). Dropped the over-broad "reflect anything
+  moving outward" clause. (`src/sim/physics.ts` paddleHitTest/SweptHitTest +
+  handlePaddleCollisions.) Deliberately did NOT add a full-arc keeper — a ball
+  beating an out-of-position paddle to an undefended part of its arc SHOULD score.
+- `MAX_CHARGE` 10 → 4 (`constants.ts`) so the grab/super is reachable.
+- HUD (`main.ts` + `styles.css`): `localSlot` marks "your" card (YOU tag) + bigger
+  lives pips; charge meter has a pulsing "SUPER" ready state; your own paddle
+  glows in-arena when ready. `CHARGE_READY_AT = MAX_CHARGE-1` (addCharge bumps
+  before the catch check).
+- **Regression test: `node scripts/verify-paddle.cjs`** — runs the built
+  `dist-server` sim headless. RUN IT before any future physics deploy.
+
+**Round 2 — host-controlled settings during ready-up (`30384c7`):**
+- New `{t:"setSetting"}` client msg + `hostSlot`/`difficulty`/`gameVariant`/
+  `triangleMotion` echoed in `{t:"room"}` (`shared/protocol.ts`). Host = lowest-
+  slot connected human (derived in `room.ts`, auto-reassigns). Only the host, only
+  on lobby/matchOver, may change rules — server enforces via `canChangeSettings`
+  (`room.setSetting`/`setBots`). `setBots` is now host-gated too (was open).
+- Client setters route through the server when networked (mirror `toggleBotFill`);
+  `setTheme` stays per-client cosmetic. Rules controls live on the session ready
+  panel (interactive for host, read-only chips for others). Rule changes apply
+  silently (no ready reset); applied at next `beginMatch` (reads live sim).
+- Was a real bug: difficulty/variant/triangle did NOTHING online before (never sent).
+
+## Done earlier (prior session) — all on `feat/arcade-home-and-scale`, pushed `mine`
 
 - **Center triangle no longer tunnels** — `handleTriangleCollision` (`src/sim/physics.ts`)
   now ejects the ball out the nearest edge when its center penetrates, instead of
@@ -145,7 +197,11 @@ the necrobyte-rivals overhaul, gauntlet sprites, blueprints. **Our** Caddyfile
 deployed; it'll get committed when the parallel bundle lands, or isolate just that
 hunk if needed).
 
-## Still-open feedback (`Feedback.md`, older — music)
+## Low-priority music notes (`Feedback.md` — NOT hub feedback)
+
+> ⚠️ `Feedback.md` is a STALE local note, **not** the Wii-hub feedback store. As
+> of 2026-06-13 the live hub store did not contain these music items — they are
+> low priority. Confirm against the live store before spending time here.
 
 1. Switch music on player **elimination** (4 players → round-one track, 3 →
    round-two, 2 → final), not on every score.
@@ -153,8 +209,10 @@ hunk if needed).
 3. The loop **doesn't loop seamlessly** (fades for a beat before restarting).
 
 Relevant code: `currentMusicTrack()` / `updateMusic()` in `src/main.ts`. Track
-selection already gates on active player count; the real fixes are the goal-time
-dropout and the seamless loop.
+selection already gates on active player count. Note `MUSIC_TRACKS` has 4 tracks
+but only 3 active player-count states (4p/3p/2p → tracks 0/1/2); track 3
+(`music-round-final`) is loaded but unused — wire it to the 2-player final if you
+tackle #1.
 
 ## Useful tuning knobs (`src/sim/constants.ts` unless noted)
 
