@@ -1,13 +1,34 @@
 /**
- * Type surface for the Terrabyte Arcade HOME overlay.
+ * Terrabyte Arcade — HOME overlay type surface (CANONICAL — single source of truth).
  *
- * The overlay itself is injected at runtime by the hub at /__arcade/home.js
- * (it 404s in local dev), so this is an ambient declaration only — no import.
- * Mirrors the v2 API contract that all arcade games depend on verbatim.
+ * This types the `window.__arcadeHome` API exposed by the UNIVERSAL Wii HOME
+ * overlay. The overlay is ONE file — `hub/public/__arcade/home.js` — served by the
+ * hub and proxied onto every game subdomain (Caddy `import arcade_home`). It is the
+ * SAME on every game and is edited in ONE place (this workspace); it is never forked
+ * per-game. Games do not host it — they load it with:
+ *
+ *     <script src="/__arcade/home.js" defer></script>
+ *
+ * and it 404s in local dev, so EVERY `window.__arcadeHome?.…` call must be guarded.
+ *
+ * Each game keeps a COPY of this file at `src/arcade-home.d.ts` (an ambient .d.ts —
+ * no import). When the overlay API changes, edit THIS canonical file, then re-sync
+ * the copies into every game so the type surface never drifts game-to-game.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * RESERVED / STANDARD KEYBINDS — identical on every arcade game:
+ *   Esc      ALWAYS toggles the universal HOME overlay. The overlay owns Esc
+ *            (capture-phase) on every game; games MUST NOT bind Esc.
+ *   M        the GAME's own in-game menu (pause card / inventory / settings / help).
+ *   (overlay) Arrow keys / Tab navigate its buttons; Enter/Space activate; Esc closes.
+ *   Everything else is game-specific gameplay — just never collide with Esc or M.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 interface ArcadeHomeMenuItemContext {
+  /** Close the overlay (the game resumes via the arcade:home-close event). */
   close(): void;
+  /** Re-read every dynamic getLabel()/disabled() and repaint in place (no close). */
   refresh(): void;
 }
 
@@ -17,7 +38,7 @@ interface ArcadeHomeMenuItem {
   /** Dynamic label; re-read on every open AND after any select. Wins over `label`. */
   getLabel?: () => string;
   onSelect: (ctx: ArcadeHomeMenuItemContext) => void;
-  /** Default false. true => overlay closes (game resumes) after onSelect. */
+  /** Default false. true => overlay closes (game resumes) after onSelect runs. */
   closeOnSelect?: boolean;
   kind?: "primary" | "default";
   /** Re-evaluated on every open; disabled items render dimmed + inert. */
@@ -28,19 +49,38 @@ interface ArcadeHomeMenuConfig {
   items: ArcadeHomeMenuItem[];
 }
 
+/** One seat for the overlay's bottom Wii P1-P4 LED strip (v2.2 setPlayers API). */
+interface ArcadeHomePlayer {
+  /** 0-based seat (0..3); omit to place in registration order. */
+  slot?: number;
+  /** Shown under the seat (truncated; rendered via textContent — XSS-safe). */
+  name?: string;
+  /** Default true; false dims the seat (e.g. a dropped player). */
+  connected?: boolean;
+  /** Styles the seat as a CPU/bot fill. */
+  isBot?: boolean;
+  /** Marks the local player's seat. */
+  you?: boolean;
+}
+
 interface ArcadeHomeOverlay {
   version: string;
   open(): void;
   close(): void;
   toggle(): void;
   readonly isOpen: boolean;
-  /** v2: register/replace this game's menu section. Safe before OR after boot. */
+  /** v2: register/replace this game's pause-menu items. Safe before OR after boot. */
   registerGameMenu?: (config: ArcadeHomeMenuConfig) => void;
-  /** v2: remove the game's items. */
+  /** v2: remove this game's items. */
   clearGameMenu?: () => void;
+  /** v2.2: push the live roster to the bottom P1-P4 strip. */
+  setPlayers?: (players: ArcadeHomePlayer[]) => void;
+  /** v2.2: clear the roster back to empty "Open" placeholders. */
+  clearPlayers?: () => void;
 }
 
 interface Window {
   __arcadeHomeOverlay?: ArcadeHomeOverlay;
+  /** v2 alias for __arcadeHomeOverlay — prefer this. */
   __arcadeHome?: ArcadeHomeOverlay;
 }
