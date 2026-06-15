@@ -57,7 +57,8 @@ import {
   MENU_BALL_SPEED,
   PADDLE_ASSIST_ACCELERATION,
   PADDLE_ASSIST_DECELERATION,
-  PADDLE_CURVE_RESPONSE,
+  PADDLE_MAX_DEFLECT,
+  PADDLE_MIN_INWARD,
   PADDLE_MOVE_ASSIST,
   PADDLE_RELEASE_GAP,
   PADDLE_SPEED_RAMP,
@@ -67,6 +68,7 @@ import {
   TRIANGLE_GRAVITY,
   TRIANGLE_PHASE_DELAY,
   TRIANGLE_REACTIVE_DAMPING,
+  TRIANGLE_REACTIVE_IMPULSE_GAIN,
   TRIANGLE_REACTIVE_MAX_SPEED,
   TRIANGLE_REACTIVE_MIN_SPEED,
   TRIANGLE_ROTATION_SPEED
@@ -506,7 +508,7 @@ function applyTriangleReactiveImpulse(state: SimState, arena: ArenaGeometry, con
   const tangentPush = lever.x * incoming.y - lever.y * incoming.x;
   const speedFactor = clamp(lengthVec(incoming) / MAX_BALL_SPEED, 0.28, 1.6);
   const direction = Math.sign(tangentPush) || Math.sign(state.triangleAngularVelocity) || 1;
-  const impulse = direction * clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.3, 1.6) * speedFactor * 3.4;
+  const impulse = direction * clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.3, 1.6) * speedFactor * TRIANGLE_REACTIVE_IMPULSE_GAIN;
   state.triangleAngularVelocity = clamp(
     state.triangleAngularVelocity + impulse,
     -TRIANGLE_REACTIVE_MAX_SPEED,
@@ -525,11 +527,8 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
       continue;
     }
 
-    const tangent = { x: -hit.radial.y, y: hit.radial.x };
-    const roundedNormal = normalizeVecInPlace({
-      x: hit.normal.x + tangent.x * (hit.offset * PADDLE_CURVE_RESPONSE),
-      y: hit.normal.y + tangent.y * (hit.offset * PADDLE_CURVE_RESPONSE)
-    });
+    const radial = hit.radial; // unit centre→paddle (outward); inward = -radial
+    const tangent = { x: -radial.y, y: radial.x };
     const repeatHit = state.lastTouchType === "player" && state.lastTouchPlayerId === player.id;
 
     addCharge(player);
@@ -539,7 +538,7 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
       kind: "paddleHit",
       playerId: player.id,
       contact: cloneVec(hit.contact),
-      radial: cloneVec(hit.radial),
+      radial: cloneVec(radial),
       tangent: cloneVec(tangent),
       tangentSign: tangentDrift === 0 ? 1 : -Math.sign(tangentDrift),
       repeatHit,
@@ -553,29 +552,45 @@ function handlePaddleCollisions(state: SimState, arena: ArenaGeometry, events: S
       return;
     }
 
-    // Reflect when the ball is heading into the paddle face, or when it tunnelled
-    // across the face this substep. We no longer reflect "anything moving
-    // outward": with the back arc excluded from the hit test the only contacts
-    // left are the inner cup, and that clause was what bounced balls off empty
-    // space beside the paddle. A ball that beats an out-of-position paddle to an
-    // undefended part of the arc is supposed to score — that's the game.
-    if (dotVec(state.velocity, roundedNormal) < 0 || hit.crossed) {
-      reflectBall(state, roundedNormal);
+    // Predictable contact-point steering (classic paddle feel): WHERE along the
+    // face the ball lands — hit.offset in [-1,1], 0 = centre, ±1 = wings — sets a
+    // controlled deflection off the pure-inward direction, INDEPENDENT of the
+    // incoming angle. This replaces the old mirror-reflection-plus-curve double
+    // blend that made bounces feel random and could graze the goal line. Because
+    // cos(steer) ≥ 0, the exit is inherently inward; the floor below guarantees a
+    // minimum inward component, so a clean paddle hit can never self-score "off
+    // some BS". Incoming speed is preserved (the usual ×1.02 / cap).
+    const steer = clamp(hit.offset, -1, 1) * PADDLE_MAX_DEFLECT;
+    const cos = Math.cos(steer);
+    const sin = Math.sin(steer);
+    let exitDir: Vec2 = {
+      x: -radial.x * cos + tangent.x * sin,
+      y: -radial.y * cos + tangent.y * sin
+    };
+    if (-dotVec(exitDir, radial) < PADDLE_MIN_INWARD) {
+      const tSign = Math.sign(dotVec(exitDir, tangent)) || (hit.offset >= 0 ? 1 : -1);
+      const tanComp = Math.sqrt(Math.max(0, 1 - PADDLE_MIN_INWARD * PADDLE_MIN_INWARD)) * tSign;
+      exitDir = {
+        x: -radial.x * PADDLE_MIN_INWARD + tangent.x * tanComp,
+        y: -radial.y * PADDLE_MIN_INWARD + tangent.y * tanComp
+      };
     }
+    normalizeVecInPlace(exitDir);
+
+    const exitSpeed = Math.min(lengthVec(state.velocity) * 1.02, MAX_BALL_SPEED);
+    state.velocity.x = exitDir.x * exitSpeed;
+    state.velocity.y = exitDir.y * exitSpeed;
 
     if (repeatHit) {
       boostBallSpeed(state, REPEAT_HIT_BOOST);
     }
     state.lastTouchType = "player";
     state.lastTouchPlayerId = player.id;
-    // Always settle the ball on the centre-facing side of the paddle. If the
-    // curve-adjusted normal points outward (a wing/edge contact), push along the
-    // inward radial instead so the ball can never be nudged into the goal.
-    const releaseNormal = dotVec(roundedNormal, hit.radial) > 0
-      ? { x: -hit.radial.x, y: -hit.radial.y }
-      : roundedNormal;
-    state.ball.x = hit.contact.x + releaseNormal.x * (BALL_RADIUS + PADDLE_RELEASE_GAP);
-    state.ball.y = hit.contact.y + releaseNormal.y * (BALL_RADIUS + PADDLE_RELEASE_GAP);
+    // Settle the ball on the centre-facing side along the inward radial so it can
+    // never be left sitting past the goal line (exitDir is inward too, but the
+    // pure radial release is the robust choice regardless of steer).
+    state.ball.x = hit.contact.x - radial.x * (BALL_RADIUS + PADDLE_RELEASE_GAP);
+    state.ball.y = hit.contact.y - radial.y * (BALL_RADIUS + PADDLE_RELEASE_GAP);
     return;
   }
 }

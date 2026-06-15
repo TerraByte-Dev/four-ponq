@@ -12,7 +12,7 @@
  */
 const { createSimState, advanceBall } = require("../dist-server/src/sim/physics.js");
 const { computeArena, rebuildArcs } = require("../dist-server/src/sim/geometry.js");
-const { MAX_CHARGE, MAX_SHIELDS, BASE_BALL_SPEED } = require("../dist-server/src/sim/constants.js");
+const { MAX_CHARGE, MAX_SHIELDS, BASE_BALL_SPEED, PADDLE_MIN_INWARD } = require("../dist-server/src/sim/constants.js");
 
 const arena = computeArena(960, 640);
 const DT = 1 / 60;
@@ -78,6 +78,16 @@ const hitP1 = (b) => b.some((e) => e.kind === "paddleHit" && e.playerId === 1);
 const goalAny = (b) => b.some((e) => e.kind === "goal");
 const caught = (b) => b.some((e) => e.kind === "catchStart");
 
+const paddleHitEvent = (events) => events.find((e) => e.kind === "paddleHit" && e.playerId === 1);
+const unitDot = (v, n) => {
+  const sp = Math.hypot(v.x, v.y) || 1;
+  return (v.x * n.x + v.y * n.y) / sp;
+};
+// How strongly the exit heads back toward centre (1 = straight in, 0 = parallel).
+const inwardComponent = (v, radial) => -unitDot(v, radial);
+// Sideways steer of the exit (sign = which way along the face).
+const tangentComponent = (v, tangent) => unitDot(v, tangent);
+
 let failures = 0;
 function check(name, ok, detail) {
   const tag = ok ? "PASS" : "FAIL";
@@ -133,6 +143,47 @@ console.log(`four-ponq paddle physics — arena r=${arena.radius.toFixed(0)}, pa
   const grabbedEarly = notReady.events.some((e) => e.kind === "catchStart" && e.playerId === 1);
   const reflectedEarly = notReady.events.some((e) => e.kind === "paddleHit" && e.playerId === 1 && !e.caught);
   check(`does NOT grab below the threshold (charge=${MAX_CHARGE - 2})`, !grabbedEarly && reflectedEarly);
+}
+
+// --- Test 5: every clean paddle hit exits meaningfully inward (no graze) -----
+// The new contact-point exit model guarantees a minimum inward component, so a
+// clean hit can never skim parallel to the goal and self-score "off some BS".
+{
+  console.log("\nTest 5 — inward floor across the pocket (no parallel graze)");
+  let worst = Infinity;
+  let allHit = true;
+  for (const d of [-0.14, -0.07, 0, 0.07, 0.14]) {
+    const { events, velocity } = fireShot({ angle: paddleAngle + d, stopOn: (b) => hitP1(b) || goalAny(b) });
+    const ev = paddleHitEvent(events);
+    if (!ev) { allHit = false; continue; }
+    worst = Math.min(worst, inwardComponent(velocity, ev.radial));
+  }
+  check("all five in-pocket shots hit the paddle", allHit);
+  check(`exit inward component >= PADDLE_MIN_INWARD (${PADDLE_MIN_INWARD})`, worst >= PADDLE_MIN_INWARD - 1e-6, `worst=${worst.toFixed(3)}`);
+}
+
+// --- Test 6: contact point steers the exit predictably (classic paddle feel) -
+{
+  console.log("\nTest 6 — contact-point steering is monotonic + sign-correct");
+  const sample = (d) => {
+    const { events, velocity } = fireShot({ angle: paddleAngle + d, stopOn: (b) => hitP1(b) || goalAny(b) });
+    const ev = paddleHitEvent(events);
+    return ev ? tangentComponent(velocity, ev.tangent) : null;
+  };
+  const left = sample(-0.14);
+  const mid = sample(0);
+  const right = sample(0.14);
+  check("centre hit goes nearly straight in (little steer)", mid !== null && Math.abs(mid) < 0.2, `mid=${mid?.toFixed(3)}`);
+  check("opposite offsets steer opposite ways", left !== null && right !== null && Math.sign(left) === -Math.sign(right) && left !== 0);
+  check("more offset → more steer", left !== null && right !== null && Math.abs(right) > Math.abs(mid) && Math.abs(left) > Math.abs(mid));
+}
+
+// --- Test 7: the exit model is deterministic (no RNG / clock creep) ----------
+{
+  console.log("\nTest 7 — deterministic exit (server/headless parity)");
+  const a = fireShot({ angle: paddleAngle + 0.1, stopOn: (b) => hitP1(b) || goalAny(b) });
+  const b = fireShot({ angle: paddleAngle + 0.1, stopOn: (b) => hitP1(b) || goalAny(b) });
+  check("same shot twice → identical exit velocity", a.velocity.x === b.velocity.x && a.velocity.y === b.velocity.y);
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);

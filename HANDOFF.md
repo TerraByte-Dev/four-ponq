@@ -11,6 +11,40 @@ NOT this repo's `Feedback.md` (which is a stale, separate channel).**
 `ssh terrabyte@192.168.1.207 'docker exec arcade-api cat /data/feedback.ndjson'`
 and filter `gameId=four-ponq`).
 
+**Session 2026-06-15 shipped the two newest hub-feedback items — LIVE, one deploy:**
+1. **"Reactive doesn't work / physics aren't physicing / lose a life to BS"** →
+   ROOT CAUSE was a desync: the sim already swivels the reactive triangle on
+   impact, but `triangleRotation` was never on the wire, so the client rendered
+   its OWN local spin while the ball bounced off the server's (different) pose.
+   FIX: `triangleRotation` added to `{t:"snap"}` (`shared/protocol.ts`), populated
+   in `broadcastSnap` (`server/room.ts`), buffered + wrap-safe `lerpAngle`-
+   interpolated in `src/net/client.ts`, and rendered via `this.netTriangleRotation`
+   in `drawTriangle` (offline still uses the local sim). Impulse gain bumped
+   (`TRIANGLE_REACTIVE_IMPULSE_GAIN = 4.2`).
+   Also reworked the PADDLE bounce: `handlePaddleCollisions` now constructs a
+   predictable contact-point exit angle (classic-paddle steer off `hit.offset`,
+   `PADDLE_MAX_DEFLECT`) with a guaranteed inward floor (`PADDLE_MIN_INWARD`) so a
+   clean hit can never graze the goal line and self-score. `INTERP_DELAY_MS`
+   100→70 to cut the predicted-paddle-vs-interpolated-ball visual offset.
+2. **"Lives/super still top-left — I want them behind each user's section"** →
+   per-player HUD now drawn IN-ARENA behind each paddle (`drawPaddleClusters` in
+   `src/main.ts`): lives pips + a super-charge ring that fills + pulses when ready
+   + the player's hand-drawn HUB DOODLE AVATAR (name-initial disc fallback). The
+   top-left `.score-strip` is hidden (`styles.css`); the status chip stays.
+   Avatars use the hub-chat pattern: each client reports its `publicId` (from
+   `/api/profile`) via `{t:"hello"}`/`{t:"setProfile"}`; the server relays it in
+   `PlayerView`; peers fetch the doodle from `GET /api/profile/by-id/<publicId>`
+   and decode it to a Phaser texture (`avatarState` cache + image/text pools).
+
+Tests: `scripts/verify-paddle.cjs` (extended: inward floor, monotonic steer,
+determinism) + new `scripts/verify-triangle.cjs` (impulse fires, pose live,
+per-snap Δ < π). 2-client headless Playwright smoke = 0 errors, clusters render,
+per-client view rotation + peer avatars confirmed (`playtest-cluster-p{1,2}.png`).
+TUNABLES to eyeball live: cluster size/offset in `drawPaddleClusters`
+(bottom-section badge can tuck near the controls bar on short windows),
+`PADDLE_MAX_DEFLECT`/`PADDLE_MIN_INWARD`, the triangle reactive constants,
+`INTERP_DELAY_MS`.
+
 **Session 2026-06-13 shipped all 3 live hub-feedback items in two deploys — both
 LIVE + committed/pushed to `mine` (`53352f6` paddle/UI, `30384c7` host-settings):**
 1. **Paddle physics "not physicing"** → real collision bugs fixed (see Round 1).

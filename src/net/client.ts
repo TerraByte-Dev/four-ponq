@@ -43,8 +43,14 @@ export { COUNTDOWN_SECONDS };
 export const NET_ARENA_WIDTH = 960;
 export const NET_ARENA_HEIGHT = 640;
 
-/** Render this many ms behind the newest snapshot for smooth interpolation. */
-const INTERP_DELAY_MS = 100;
+/**
+ * Render this many ms behind the newest snapshot for smooth interpolation. At
+ * 30 Hz snapshots are ~33 ms apart, so ~70 ms still buffers ~2 snaps (always two
+ * bracketing endpoints) while halving the visual gap between the interpolated
+ * ball and the locally-predicted own paddle — which is what made our own bounces
+ * look like they happened "in front of" the paddle.
+ */
+const INTERP_DELAY_MS = 70;
 
 /** Drop buffered snapshots older than this (keeps the buffer tiny). */
 const SNAP_BUFFER_MS = 1000;
@@ -67,6 +73,8 @@ interface BufferedSnap {
   charges: number[];
   shields: number[];
   eliminated: boolean[];
+  /** Authoritative center-triangle orientation (radians). */
+  triangleRotation: number;
 }
 
 /** What main.ts reads each frame to drive sprites/HUD. */
@@ -78,6 +86,8 @@ export interface NetRenderState {
   charges: number[];
   shields: number[];
   eliminated: boolean[];
+  /** Interpolated server triangle pose — render THIS, not a local spin. */
+  triangleRotation: number;
 }
 
 export interface NetClientOptions {
@@ -102,6 +112,8 @@ export class NetClient {
   private _state: ConnState = "connecting";
   private _slot = -1;
   private _clientId = "";
+  /** Our own hub profile public id (for the avatar relay); "" until learned. */
+  private _publicId = "";
   private _players: PlayerView[] = [];
   private _mode: RoomMode = "lobby";
   private _botFill = true;
@@ -157,7 +169,11 @@ export class NetClient {
 
     this.ws.addEventListener("open", () => {
       this.setState("open");
-      this.send({ t: "hello", name: this.opts.name });
+      this.send(
+        this._publicId
+          ? { t: "hello", name: this.opts.name, publicId: this._publicId }
+          : { t: "hello", name: this.opts.name }
+      );
     });
     this.ws.addEventListener("message", (ev) => this.onMessage(ev));
     this.ws.addEventListener("close", () => this.setState("closed"));
@@ -189,6 +205,19 @@ export class NetClient {
   setName(name: string): void {
     this.opts.name = name;
     this.send({ t: "setName", name });
+  }
+
+  /**
+   * Report our arcade-hub profile public id (learned async from /api/profile).
+   * Stored so a (re)connect includes it in the hello; also pushed now if open,
+   * so the server can relay it and peers can fetch our doodle avatar.
+   */
+  setProfile(publicId: string): void {
+    if (!publicId || publicId === this._publicId) {
+      return;
+    }
+    this._publicId = publicId;
+    this.send({ t: "setProfile", publicId });
   }
 
   /** Spectator → "Jump in?". No-op while a deferred seat is already pending. */
@@ -298,7 +327,8 @@ export class NetClient {
       paddles: msg.paddles.slice(),
       charges: msg.charges.slice(),
       shields: msg.shields.slice(),
-      eliminated: msg.eliminated.slice()
+      eliminated: msg.eliminated.slice(),
+      triangleRotation: msg.triangleRotation
     });
 
     // Trim old snaps; keep at least the last 2 for interpolation endpoints.
@@ -367,6 +397,8 @@ export class NetClient {
 
     const ballSim = lerpBall(a.ball, b.ball, t);
     const ball = mapBall(ballSim.x, ballSim.y);
+    // Wrap-safe so the spin never lerps backwards across the ±PI seam.
+    const triangleRotation = lerpAngle(a.triangleRotation, b.triangleRotation, t);
 
     const slots = Math.max(a.paddles.length, b.paddles.length, MAX_PLAYERS);
     const paddles: number[] = [];
@@ -390,7 +422,7 @@ export class NetClient {
       eliminated[i] = b.eliminated[i] ?? a.eliminated[i] ?? false;
     }
 
-    return { ball, paddles, charges, shields, eliminated };
+    return { ball, paddles, charges, shields, eliminated, triangleRotation };
   }
 
   /**

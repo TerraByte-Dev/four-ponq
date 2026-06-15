@@ -138,8 +138,15 @@ body {
   pointer-events: none;
 }
 
+/*
+ * The per-player lives/super cards now live IN-ARENA, drawn behind each paddle's
+ * section (see drawPaddleClusters in main.ts) — players asked for them "resting
+ * behind the user's section", not stacked in the top-left. The status chip in
+ * #hud stays. The .score-strip rules below are retained (the HUD event still
+ * writes into the hidden node) so this is a one-line, fully reversible hide.
+ */
 .score-strip {
-  display: grid;
+  display: none;
   grid-template-columns: repeat(4, minmax(86px, 1fr));
   gap: 8px;
   max-width: min(620px, calc(100vw - 28px));

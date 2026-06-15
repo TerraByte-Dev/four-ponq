@@ -1,6 +1,6 @@
 import Phaser from "phaser";
 import "./styles.css";
-import { TAU, shortestAngleDelta, type Vec2 } from "./sim/math";
+import { TAU, pointOnCircle, shortestAngleDelta, type Vec2 } from "./sim/math";
 import type {
   ArenaGeometry,
   BotDifficulty,
@@ -206,6 +206,14 @@ const WIN_FANFARE_KEYS = [
 // the in-arena glow both treat this value as "full / ready".
 const CHARGE_READY_AT = Math.max(1, MAX_CHARGE - 1);
 
+/** Transparent placeholder texture so the avatar image pool can exist pre-load. */
+const AVATAR_BLANK_TEX = "fp-avatar-blank";
+
+/** Phaser texture key for a player's decoded doodle avatar (keyed by public id). */
+function avatarTexKey(publicId: string): string {
+  return "fp-avatar:" + publicId;
+}
+
 const MUSIC_TRACKS = [
   {
     key: "music-round-01",
@@ -373,6 +381,21 @@ class FourPongScene extends Phaser.Scene {
   private seatFlashUntil = -Infinity;
   /** Winner line captured at the matchOver event, shown on the ready screen. */
   private lastResultLine = "";
+  /**
+   * Interpolated authoritative triangle pose from the server snapshot. While
+   * networked we render THIS (not the local sim spin) so the visible triangle
+   * matches the surface the ball actually bounces off. null = offline / no snap
+   * yet → fall back to the local sim's triangleRotation.
+   */
+  private netTriangleRotation: number | null = null;
+  /** Our own hub profile public id (for the avatar relay); "" until learned. */
+  private localPublicId = "";
+  /** Per-publicId doodle load state — avoids refetch; texture = avatarTexKey(). */
+  private readonly avatarState = new Map<string, "loading" | "ready" | "failed">();
+  /** Per-slot doodle-avatar images, counter-rotated, drawn behind each section. */
+  private avatarSprites: Phaser.GameObjects.Image[] = [];
+  /** Per-slot initial-letter fallback labels (shown when a slot has no avatar). */
+  private clusterInitials: Phaser.GameObjects.Text[] = [];
 
   constructor() {
     super("four-pong");
@@ -497,6 +520,7 @@ class FourPongScene extends Phaser.Scene {
     ];
     this.sim = createSimState({ players: this.players, ball: this.ball, velocity: this.velocity });
     this.applyPlayerTheme();
+    this.createClusterHud();
 
     this.scale.on("resize", this.handleResize, this);
     rebuildArcs(this.arena(), this.players);
@@ -521,13 +545,24 @@ class FourPongScene extends Phaser.Scene {
       if (!res.ok) {
         return;
       }
-      const data = (await res.json()) as { displayName?: unknown };
+      const data = (await res.json()) as { displayName?: unknown; publicId?: unknown; avatar?: unknown };
       const name = typeof data.displayName === "string" ? sanitizePlayerName(data.displayName) : "";
       if (name && name !== this.playerName) {
         this.setPlayerName(name);
       }
+      // Report our hub profile id so peers can fetch + show our doodle avatar,
+      // and seed our OWN avatar straight from this response (no second fetch).
+      const publicId = typeof data.publicId === "string" ? data.publicId : "";
+      if (publicId) {
+        this.localPublicId = publicId;
+        this.net?.setProfile(publicId);
+        const avatar = typeof data.avatar === "string" ? data.avatar : "";
+        if (avatar) {
+          this.loadAvatarTexture(publicId, avatar);
+        }
+      }
     } catch {
-      // No arcade backend reachable — keep the local name.
+      // No arcade backend reachable — keep the local name + initial-letter HUD.
     }
   }
 
@@ -590,6 +625,10 @@ class FourPongScene extends Phaser.Scene {
         const local = this.players[pv.slot];
         if (local && pv.name) {
           local.name = pv.name;
+        }
+        // Lazily fetch each seat's doodle avatar (cached by public id).
+        if (pv.publicId) {
+          this.ensureAvatar(pv.publicId);
         }
       }
       // Mirror server match mode onto the local enum the renderer/overlay read.
@@ -732,6 +771,11 @@ class FourPongScene extends Phaser.Scene {
     this.net?.close();
     this.net = undefined;
     this.networked = false;
+    this.netTriangleRotation = null;
+    this.avatarSprites.forEach((s) => s.destroy());
+    this.avatarSprites = [];
+    this.clusterInitials.forEach((t) => t.destroy());
+    this.clusterInitials = [];
     this.stopMusic();
   }
 
@@ -851,6 +895,8 @@ class FourPongScene extends Phaser.Scene {
    */
   private applyNetRenderState(render: NetRenderState) {
     this.ball.set(render.ball.x, render.ball.y);
+    // Adopt the server's authoritative triangle pose for rendering (see field doc).
+    this.netTriangleRotation = render.triangleRotation;
 
     let eliminationChanged = false;
     this.players.forEach((player, slot) => {
@@ -1119,6 +1165,7 @@ class FourPongScene extends Phaser.Scene {
     this.drawTriangle(arena, theme);
     this.drawPaddles(arena);
     this.drawChargeGlow(arena);
+    this.drawPaddleClusters(arena);
     this.drawSeatFlash(arena);
     this.drawBallTrail(theme);
     this.drawServeIndicator(theme);
@@ -1149,7 +1196,12 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private drawTriangle(arena: ArenaGeometry, theme: ThemeDefinition) {
-    const vertices = triangleVertices(arena, this.sim.triangleRotation);
+    // Networked: render the interpolated SERVER pose so the drawn triangle is the
+    // exact surface the authoritative ball bounces off. Offline: local sim spin.
+    const rotation = this.networked && this.netTriangleRotation !== null
+      ? this.netTriangleRotation
+      : this.sim.triangleRotation;
+    const vertices = triangleVertices(arena, rotation);
     this.gfx.fillStyle(theme.triangleFill, 1);
     this.gfx.lineStyle(2, theme.triangleStroke, 0.62);
     this.gfx.beginPath();
@@ -1205,6 +1257,176 @@ class FourPongScene extends Phaser.Scene {
     this.gfx.strokeCircle(pos.x, pos.y, 22 + pulse * 7);
     this.gfx.lineStyle(6, player.color, 0.28 + 0.5 * pulse);
     this.gfx.strokeCircle(pos.x, pos.y, 34 + pulse * 9);
+  }
+
+  /**
+   * One-time setup of the per-slot in-arena HUD pool: a transparent placeholder
+   * texture plus one avatar Image + one initial-letter Text per slot. They live
+   * at depth 10/11 (above the single immediate-mode gfx layer) and are merely
+   * re-positioned each frame in drawPaddleClusters — never re-created.
+   */
+  private createClusterHud() {
+    if (!this.textures.exists(AVATAR_BLANK_TEX)) {
+      const blank = this.make.graphics({ x: 0, y: 0 }, false);
+      blank.fillStyle(0xffffff, 0);
+      blank.fillRect(0, 0, 2, 2);
+      blank.generateTexture(AVATAR_BLANK_TEX, 2, 2);
+      blank.destroy();
+    }
+    for (let i = 0; i < this.players.length; i += 1) {
+      this.avatarSprites.push(
+        this.add.image(0, 0, AVATAR_BLANK_TEX).setVisible(false).setDepth(10)
+      );
+      this.clusterInitials.push(
+        this.add
+          .text(0, 0, "", { fontFamily: "Arial, sans-serif", color: "#ffffff", fontStyle: "bold" })
+          .setOrigin(0.5)
+          .setVisible(false)
+          .setDepth(11)
+      );
+    }
+  }
+
+  /**
+   * Kick off a one-time fetch + decode of a peer's hub doodle avatar by public
+   * id (mirrors the hub-chat avatar pattern: public, email-free lookup). The
+   * decoded PNG becomes a Phaser texture the cluster renderer draws behind that
+   * player's section. Best-effort — bots / no-profile / offline fall back to the
+   * name-initial disc.
+   */
+  private ensureAvatar(publicId: string) {
+    if (!publicId || this.avatarState.has(publicId)) {
+      return;
+    }
+    this.avatarState.set(publicId, "loading");
+    fetch(`/api/profile/by-id/${encodeURIComponent(publicId)}`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { profile?: { avatar?: unknown } } | null) => {
+        const avatar = data && typeof data.profile?.avatar === "string" ? data.profile.avatar : "";
+        if (avatar) {
+          this.loadAvatarTexture(publicId, avatar);
+        } else {
+          this.avatarState.set(publicId, "failed");
+        }
+      })
+      .catch(() => this.avatarState.set(publicId, "failed"));
+  }
+
+  /** Decode a `data:image/png;…` doodle into a Phaser texture keyed by public id. */
+  private loadAvatarTexture(publicId: string, dataUrl: string) {
+    const key = avatarTexKey(publicId);
+    if (this.textures.exists(key)) {
+      this.avatarState.set(publicId, "ready");
+      return;
+    }
+    this.avatarState.set(publicId, "loading");
+    const img = new Image();
+    img.onload = () => {
+      if (!this.textures.exists(key)) {
+        this.textures.addImage(key, img);
+      }
+      this.avatarState.set(publicId, "ready");
+    };
+    img.onerror = () => this.avatarState.set(publicId, "failed");
+    img.src = dataUrl;
+  }
+
+  /**
+   * Per-player HUD drawn IN-ARENA behind each paddle's section (answers the
+   * "lives/super resting behind the user's section, not top-left" feedback):
+   * a backing disc with the hub doodle avatar (or a name-initial fallback), a
+   * super-charge ring that fills + pulses when ready, and a row of lives pips
+   * just outside the goal ring. Anchored at the section's arc midpoint so it
+   * sits still rather than chasing the moving paddle. The disc/ring/pips are
+   * rotation-agnostic and ride the camera spin; the avatar/initial counter-
+   * rotate so they stay upright for whoever's view is on top.
+   */
+  private drawPaddleClusters(arena: ArenaGeometry) {
+    const net = this.net;
+    const localSlot = this.localSlot();
+    const center = arena.center;
+    const discR = Phaser.Math.Clamp(arena.radius * 0.07, 12, 17);
+    const pipRingR = arena.radius + 7;
+    const discCenterR = arena.radius + discR + 11;
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.012);
+
+    for (let i = 0; i < this.players.length; i += 1) {
+      const player = this.players[i];
+      const sprite = this.avatarSprites[i];
+      const initial = this.clusterInitials[i];
+      if (!sprite || !initial) {
+        continue;
+      }
+      // Stable section centre (arc midpoint), not the moving paddle angle.
+      const angle = (player.arcStart + player.arcEnd) / 2;
+      const discPos = pointOnCircle(center, angle, discCenterR);
+      const dim = player.eliminated ? 0.4 : 1;
+      const isSelf = i === localSlot;
+
+      // Backing disc.
+      this.gfx.fillStyle(player.color, 0.16 * dim);
+      this.gfx.fillCircle(discPos.x, discPos.y, discR + 3);
+      // Super-charge ring: dim track + a coloured progress arc from the top.
+      this.gfx.lineStyle(3, 0xffffff, 0.12 * dim);
+      this.gfx.strokeCircle(discPos.x, discPos.y, discR + 3);
+      const frac = Phaser.Math.Clamp(player.charge / CHARGE_READY_AT, 0, 1);
+      if (frac > 0 && !player.eliminated) {
+        const a0 = -Math.PI / 2;
+        this.gfx.lineStyle(3, player.color, 0.95);
+        this.gfx.beginPath();
+        this.gfx.arc(discPos.x, discPos.y, discR + 3, a0, a0 + TAU * frac, false);
+        this.gfx.strokePath();
+      }
+      // Ready: unmistakable pulsing halo (the per-player "super up" tell).
+      if (!player.eliminated && player.charge >= CHARGE_READY_AT) {
+        this.gfx.lineStyle(4, 0xffffff, 0.25 + 0.45 * pulse);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 6 + pulse * 4);
+        this.gfx.lineStyle(3, player.color, 0.4 + 0.5 * pulse);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 9 + pulse * 5);
+      }
+      // Self marker.
+      if (isSelf) {
+        this.gfx.lineStyle(2, 0xffffff, 0.8 * dim);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 6);
+      }
+
+      // Avatar image if its texture is ready, else the name-initial fallback.
+      const pv = net?.players.find((p) => p.slot === i);
+      const publicId = pv?.publicId || (isSelf ? this.localPublicId : "");
+      const ready = !!publicId && this.avatarState.get(publicId) === "ready";
+      if (ready) {
+        sprite.setTexture(avatarTexKey(publicId));
+        sprite.setDisplaySize(discR * 2, discR * 2);
+        sprite.setPosition(discPos.x, discPos.y);
+        sprite.setRotation(-this.currentViewRotation);
+        sprite.setAlpha(dim);
+        sprite.setVisible(true);
+        initial.setVisible(false);
+      } else {
+        sprite.setVisible(false);
+        initial.setText((player.name.trim()[0] || "?").toUpperCase());
+        initial.setColor(player.cssColor);
+        initial.setFontSize(Math.round(discR * 1.4));
+        initial.setPosition(discPos.x, discPos.y);
+        initial.setRotation(-this.currentViewRotation);
+        initial.setAlpha(dim);
+        initial.setVisible(true);
+      }
+
+      // Lives pips, fanned along the goal ring just outside it.
+      const spread = 0.045;
+      for (let p = 0; p < MAX_SHIELDS; p += 1) {
+        const pa = angle + (p - (MAX_SHIELDS - 1) / 2) * spread;
+        const pip = pointOnCircle(center, pa, pipRingR);
+        if (p < player.shields && !player.eliminated) {
+          this.gfx.fillStyle(player.color, 0.95);
+          this.gfx.fillCircle(pip.x, pip.y, 3.2);
+        } else {
+          this.gfx.fillStyle(0xffffff, 0.18 * dim);
+          this.gfx.fillCircle(pip.x, pip.y, 2.6);
+        }
+      }
+    }
   }
 
   /**

@@ -48,10 +48,19 @@ export const COUNTDOWN_SECONDS = 3;
 // ---------------------------------------------------------------------------
 
 export type ClientMsg =
-  /** Introduce yourself. You are seated (lobby) or made a spectator (live match). */
-  | { t: "hello"; name: string }
+  /**
+   * Introduce yourself. You are seated (lobby) or made a spectator (live match).
+   * `publicId` is the caller's arcade-hub profile public id (from GET /api/profile);
+   * the server relays it in {t:"room"} so every client can fetch + show this
+   * player's hand-drawn hub avatar via GET /api/profile/by-id/<publicId>. Optional
+   * because the /api/profile fetch is async — clients that learn it after connect
+   * send {t:"setProfile"} instead.
+   */
+  | { t: "hello"; name: string; publicId?: string }
   /** Live rename — updates your roster name (and seat name, if seated). */
   | { t: "setName"; name: string }
+  /** Late profile id (the async /api/profile resolved after hello). Relayed in {t:"room"}. */
+  | { t: "setProfile"; publicId: string }
   /** Change-only input; each field is sticky until the next input message. */
   | { t: "input"; ccw: boolean; cw: boolean; charge: boolean }
   /** Spectator asks for a seat ("Jump in?"). Seated now, or at the next serve. */
@@ -80,6 +89,13 @@ export interface PlayerView {
   connected: boolean;
   /** Ready-screen state. Always false for bots and while playing. */
   ready: boolean;
+  /**
+   * Arcade-hub profile public id, if this seat's human reported one. Clients use
+   * it to fetch + render the player's hand-drawn doodle avatar via
+   * GET /api/profile/by-id/<publicId>. Empty/absent for bots, open seats, or
+   * humans without a hub profile (the renderer falls back to a name-initial disc).
+   */
+  publicId?: string;
 }
 
 /** Room lifecycle. lobby = never-played ready screen; matchOver = post-match ready screen. */
@@ -137,6 +153,14 @@ export type ServerMsg =
       charges: number[];
       shields: number[];
       eliminated: boolean[];
+      /**
+       * Authoritative center-triangle orientation (radians). The triangle's
+       * reactive swivel is server-side gameplay — the ball bounces off THIS pose,
+       * so it MUST be on the wire and rendered (interpolated) by every client.
+       * Before this existed the client span its own local triangle and balls
+       * appeared to bounce off empty space.
+       */
+      triangleRotation: number;
     }
   /** Fire-and-forget gameplay event for client sound/fx. */
   | { t: "event"; kind: string; data?: unknown } // ballHit | goal | eliminated | matchOver | serve | countdownTick

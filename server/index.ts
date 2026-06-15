@@ -263,12 +263,21 @@ wss.on("connection", (ws: WebSocket) => {
           return; // ignore a second hello
         }
         joined = true;
-        room.connect(conn, typeof msg.name === "string" ? msg.name : "");
+        room.connect(
+          conn,
+          typeof msg.name === "string" ? msg.name : "",
+          typeof msg.publicId === "string" ? msg.publicId : ""
+        );
         break;
       }
       case "setName": {
         if (!joined) return;
         room.setName(clientId, typeof msg.name === "string" ? msg.name : "");
+        break;
+      }
+      case "setProfile": {
+        if (!joined) return;
+        room.setProfile(clientId, typeof msg.publicId === "string" ? msg.publicId : "");
         break;
       }
       case "input": {

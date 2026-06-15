@@ -101,6 +101,8 @@ interface Slot {
   clientId: string | null;
   /** Display name (human's hello name, or a bot label). */
   name: string;
+  /** Arcade-hub profile public id (for the doodle avatar); "" if none. */
+  publicId: string;
   /** Latest sticky input from the human (ignored while empty). */
   input: StickyInput;
   /** sim-elapsed ms of the last human input (for parity with lastHumanInputAt). */
@@ -155,6 +157,8 @@ export class Room {
   private readonly pendingJoins: string[] = [];
   /** hello names for ALL connections, so a spectator's name survives to seating. */
   private readonly helloNames = new Map<string, string>();
+  /** hub profile public ids for ALL connections (parallel to helloNames). */
+  private readonly helloProfiles = new Map<string, string>();
 
   constructor() {
     this.arena = computeArena(NET_ARENA_WIDTH, NET_ARENA_HEIGHT);
@@ -179,6 +183,7 @@ export class Room {
     this.slots = this.players.map((_, i) => ({
       clientId: null,
       name: `P${i + 1}`,
+      publicId: "",
       input: freshInput(),
       lastHumanInputAt: -9999,
       ready: false
@@ -210,9 +215,10 @@ export class Room {
    * SPECTATOR (slot -1): they stay in `conns` so they receive every room/snap
    * broadcast, and can ask for a seat with {t:"join"}. Returns the slot.
    */
-  connect(conn: Connection, name: string): number {
+  connect(conn: Connection, name: string, publicId = ""): number {
     this.conns.set(conn.clientId, conn);
     this.helloNames.set(conn.clientId, sanitizeName(name));
+    this.helloProfiles.set(conn.clientId, sanitizePublicId(publicId));
 
     let slot = -1;
     if (this.roomMode === "lobby" || this.roomMode === "matchOver") {
@@ -239,6 +245,7 @@ export class Room {
     const s = this.slots[slot];
     s.clientId = clientId;
     s.name = this.helloNames.get(clientId) || `P${slot + 1}`;
+    s.publicId = this.helloProfiles.get(clientId) || "";
     s.input = freshInput();
     s.ready = false;
     s.lastHumanInputAt = this.sim.elapsed;
@@ -250,6 +257,7 @@ export class Room {
   leave(clientId: string): void {
     this.conns.delete(clientId);
     this.helloNames.delete(clientId);
+    this.helloProfiles.delete(clientId);
     const queued = this.pendingJoins.indexOf(clientId);
     if (queued >= 0) {
       this.pendingJoins.splice(queued, 1);
@@ -260,6 +268,7 @@ export class Room {
       const s = this.slots[slot];
       s.clientId = null;
       s.name = `P${slot + 1}`;
+      s.publicId = "";
       s.input = freshInput();
       s.ready = false;
       this.players[slot].humanControlled = false;
@@ -360,6 +369,27 @@ export class Room {
     const slot = this.slots.findIndex((s) => s.clientId === clientId);
     if (slot >= 0) {
       this.slots[slot].name = clean;
+      this.broadcastRoom();
+    }
+  }
+
+  /**
+   * Record a connection's arcade-hub profile public id (the async /api/profile
+   * resolved after hello). Relays it in {t:"room"} so every client can fetch +
+   * render this player's doodle avatar. Empty ids are ignored (keeps current).
+   */
+  setProfile(clientId: string, publicId: string): void {
+    if (!this.conns.has(clientId)) {
+      return;
+    }
+    const clean = sanitizePublicId(publicId);
+    if (!clean) {
+      return;
+    }
+    this.helloProfiles.set(clientId, clean);
+    const slot = this.slots.findIndex((s) => s.clientId === clientId);
+    if (slot >= 0) {
+      this.slots[slot].publicId = clean;
       this.broadcastRoom();
     }
   }
@@ -813,7 +843,9 @@ export class Room {
       paddles,
       charges,
       shields,
-      eliminated
+      eliminated,
+      // The authoritative reactive-triangle pose the ball actually bounces off.
+      triangleRotation: this.sim.triangleRotation
     };
     this.broadcast(msg);
   }
@@ -828,7 +860,9 @@ export class Room {
       connected: s.clientId !== null,
       // Ready is a ready-screen/countdown thing — always false for bots and
       // while a match is playing (protocol contract for PlayerView.ready).
-      ready: s.clientId !== null && this.roomMode !== "playing" && s.ready
+      ready: s.clientId !== null && this.roomMode !== "playing" && s.ready,
+      // Relay the human's hub profile id so clients can show their doodle avatar.
+      publicId: s.clientId !== null ? s.publicId : ""
     }));
     const msg: Extract<ServerMsg, { t: "room" }> = {
       t: "room",
@@ -894,4 +928,16 @@ function sanitizeName(name: unknown): string {
   }
   // Strip ASCII control characters, then trim and cap at 12 chars.
   return name.replace(/[^ -~]/g, "").trim().slice(0, 12);
+}
+
+/**
+ * Validate an arcade-hub profile public id. publicIdFor() in arcade-api is a
+ * 16-char lowercase hex sha256 slice, so we accept only [0-9a-f], cap at 16 —
+ * the server is a dumb relay and never trusts arbitrary client strings.
+ */
+function sanitizePublicId(id: unknown): string {
+  if (typeof id !== "string") {
+    return "";
+  }
+  return id.toLowerCase().replace(/[^0-9a-f]/g, "").slice(0, 16);
 }

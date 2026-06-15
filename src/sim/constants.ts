@@ -12,8 +12,18 @@ export const TRIANGLE_ROTATION_SPEED = 0.34;
 export const TRIANGLE_REACTIVE_DAMPING = 0.998;
 export const TRIANGLE_REACTIVE_MIN_SPEED = 0.12;
 export const TRIANGLE_REACTIVE_MAX_SPEED = 4.6;
+// How hard a ball impact torques the reactive triangle's spin (tuned up once the
+// swivel became visible on every client — see the snapshot triangleRotation sync).
+export const TRIANGLE_REACTIVE_IMPULSE_GAIN = 4.2;
 export const TRIANGLE_PHASE_DELAY = 1000;
+// Legacy curve-blend factor (superseded by PADDLE_MAX_DEFLECT contact steering).
 export const PADDLE_CURVE_RESPONSE = 0.72;
+// Contact-point paddle steering: a hit at the wing (offset ±1) deflects the exit
+// this many radians off pure-inward; centre hits (offset 0) go straight back.
+export const PADDLE_MAX_DEFLECT = 1.05;
+// Floor on the exit's inward component (fraction of speed) so a clean paddle hit
+// can never graze parallel to the goal line and self-score.
+export const PADDLE_MIN_INWARD = 0.35;
 export const PADDLE_RELEASE_GAP = 2.5;
 export const PADDLE_CONCAVITY = 0.48;
 export const PADDLE_WING_LENGTH_MIN = 16;
