@@ -2258,8 +2258,13 @@ class FourPongScene extends Phaser.Scene {
       return;
     }
 
-    // --- OFFLINE (server down / local dev): local hot-seat menu ---
-    if (this.mode !== "playing") {
+    // --- OFFLINE: local hot-seat menu, but ONLY once the connection has
+    // genuinely FAILED (closed/error) — never during the initial connect
+    // handshake, which used to flash a misleading "Server offline — Start" card
+    // for a frame on every load. While still connecting we show nothing (the
+    // status chip already reads "Connecting to the arcade server…").
+    const netDead = !!net && (net.state === "closed" || net.state === "error");
+    if (netDead && this.mode !== "playing") {
       s.showPanel = true;
       s.offline = true;
       s.rows = this.sessionRowsOffline();
