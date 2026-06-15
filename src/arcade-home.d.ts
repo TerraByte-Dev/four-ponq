@@ -63,6 +63,24 @@ interface ArcadeHomePlayer {
   you?: boolean;
 }
 
+/**
+ * One chat message delivered to a game (v2.4). Same shape as the
+ * `arcade:chat-message` window-event `detail`. Text is already sanitized by the
+ * overlay — render it with textContent, never innerHTML.
+ */
+interface ArcadeChatMessage {
+  /** Sender display name — matches the roster names pushed via setPlayers(). */
+  from: string;
+  /** The message text (sanitized). */
+  text: string;
+  /** Epoch ms the message was sent. */
+  at: number;
+  /** Source room. Always "general" today (one shared arcade-wide conversation). */
+  room: string;
+  /** True when YOU sent this message. */
+  you: boolean;
+}
+
 interface ArcadeHomeOverlay {
   version: string;
   open(): void;
@@ -77,6 +95,28 @@ interface ArcadeHomeOverlay {
   setPlayers?: (players: ArcadeHomePlayer[]) => void;
   /** v2.2: clear the roster back to empty "Open" placeholders. */
   clearPlayers?: () => void;
+  /**
+   * v2.3: record an achievement unlock for this player and, the FIRST time only,
+   * show an "Achievement unlocked" toast. Idempotent + best-effort (POSTs to
+   * arcade-api /api/achievements/unlock, keyed server-side by the Access email).
+   * `id` must exist in the arcade-api catalog. See docs/arcade-achievements.md.
+   */
+  unlockAchievement?: (id: string) => void;
+  /**
+   * v2.4: post a chat message from inside the game (quick-chat / emotes). Posts to
+   * the shared "general" room (the `room` arg is currently ignored — chat is
+   * General-only). Attributed to the player's hub profile name, never the email.
+   */
+  sendChat?: (text: string, room?: string) => void;
+  /**
+   * v2.4: subscribe to incoming chat messages (same data as the
+   * `arcade:chat-message` window event). Use to draw speech bubbles over players —
+   * map `msg.from` to a seat by the names you pushed via setPlayers().
+   * See docs/arcade-chat-bubbles.md.
+   */
+  onChatMessage?: (cb: (msg: ArcadeChatMessage) => void) => void;
+  /** v2.4: remove a listener previously registered with onChatMessage. */
+  offChatMessage?: (cb: (msg: ArcadeChatMessage) => void) => void;
 }
 
 interface Window {

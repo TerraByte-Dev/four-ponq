@@ -694,6 +694,11 @@ class FourPongScene extends Phaser.Scene {
         // Capture the winner line NOW (from the final snapshot) — by the time
         // the matchOver ready screen renders, shields/eliminated may reset.
         this.lastResultLine = winner ? `${winner.name} takes the match!` : "Match over.";
+        // Achievement: the LOCAL player won this networked match (not a spectator, not a bot/other seat).
+        const mySlotNet = this.net?.slot ?? -1;
+        if (mySlotNet >= 0 && winner && this.players[mySlotNet] === winner) {
+          window.__arcadeHome?.unlockAchievement?.("four-ponq-win");
+        }
         this.spawnWinConfetti(winner);
         this.emitHud();
         break;
@@ -1024,6 +1029,10 @@ class FourPongScene extends Phaser.Scene {
         case "matchOver": {
           const winner = event.winnerId === undefined ? undefined : this.playerById(event.winnerId);
           this.message = `${winner?.name ?? "No one"} wins!`;
+          // Achievement: the human (slot-0 hot-seat) player won the offline match.
+          if (winner?.humanControlled) {
+            window.__arcadeHome?.unlockAchievement?.("four-ponq-win");
+          }
           this.playWinFanfare();
           this.spawnWinConfetti(winner);
           hudDirty = true;
