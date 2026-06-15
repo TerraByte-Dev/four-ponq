@@ -102,8 +102,25 @@ interface SessionRowState {
 interface SessionUiState {
   /** Slim top banner: watching = "press Space to jump in", pending = "joining at next serve…". */
   banner: "none" | "watching" | "pending";
-  /** Ready panel (lobby / matchOver ready screen, seated players only). */
-  showReady: boolean;
+  /**
+   * The unified menu/lobby panel (Players | Rules + Settings + primary action) —
+   * the ONE menu, shown on the load-in lobby, on match-over, when paused (M), and
+   * offline. Hidden only during live play and while spectating (banner instead).
+   */
+  showPanel: boolean;
+  /** Heading: "Online lobby" / "Match over" / "Paused" / "Four Ponq". */
+  kicker: string;
+  /** Offline (server down) — local hot-seat semantics, no ready/host concept. */
+  offline: boolean;
+  /** Locally paused mid-match (M) — roster + rules are read-only, primary = Resume. */
+  paused: boolean;
+  /** The big primary button. */
+  primaryAction: "ready" | "resume" | "start" | "none";
+  primaryLabel: string;
+  /** Whether the rule chips are clickable (offline, or networked host on a ready screen). */
+  rulesEditable: boolean;
+  /** Sub-status line under the primary button. */
+  statusLine: string;
   matchOver: boolean;
   resultLine: string;
   rows: SessionRowState[];
@@ -121,6 +138,11 @@ interface SessionUiState {
   gameVariant: GameVariant;
   triangleMotion: TriangleMotionMode;
   botFill: boolean;
+  /** Per-client cosmetics, shown in the nested Settings sub-view. */
+  themeId: ThemeId;
+  musicVolume: number;
+  sfxVolume: number;
+  playerName: string;
 }
 
 interface PaddleImpactBurst {
@@ -2152,9 +2174,16 @@ class FourPongScene extends Phaser.Scene {
    */
   private emitSession() {
     const net = this.net;
-    const state: SessionUiState = {
+    const s: SessionUiState = {
       banner: "none",
-      showReady: false,
+      showPanel: false,
+      kicker: "Four Ponq",
+      offline: !this.networked,
+      paused: this.mode === "paused",
+      primaryAction: "none",
+      primaryLabel: "",
+      rulesEditable: false,
+      statusLine: "",
       matchOver: false,
       resultLine: "",
       rows: [],
@@ -2166,46 +2195,122 @@ class FourPongScene extends Phaser.Scene {
       difficulty: this.botDifficulty,
       gameVariant: this.gameVariant,
       triangleMotion: this.triangleMotionMode,
-      botFill: this.botFill
+      botFill: this.botFill,
+      themeId: this.themeId,
+      musicVolume: this.musicVolume,
+      sfxVolume: this.sfxVolume,
+      playerName: this.playerName
     };
 
-    if (this.networked && net && net.state === "open" && this.mode !== "paused") {
-      state.seated = net.slot >= 0;
+    const dispatch = () =>
+      window.dispatchEvent(new CustomEvent<SessionUiState>("four-pong:session", { detail: s }));
 
+    // --- NETWORKED ---
+    if (this.networked && net && net.state === "open") {
+      // Locally paused mid-match (M) → the menu shows the live roster + read-only
+      // rules + a Resume action (server only allows rule changes on ready screens).
+      if (this.mode === "paused") {
+        s.showPanel = true;
+        s.kicker = "Paused";
+        s.primaryAction = "resume";
+        s.primaryLabel = "Resume (M)";
+        s.statusLine = "Press M or Esc to resume.";
+        s.rows = this.sessionRowsFromNet(net);
+        s.difficulty = net.difficulty;
+        s.gameVariant = net.gameVariant;
+        s.triangleMotion = net.triangleMotion;
+        s.botFill = net.botFill;
+        dispatch();
+        return;
+      }
+
+      s.seated = net.slot >= 0;
       if (net.slot < 0) {
-        state.banner = net.joinPending ? "pending" : "watching";
+        s.banner = net.joinPending ? "pending" : "watching";
       }
-
       if (net.mode === "countdown") {
-        state.countdown = net.countdown ?? COUNTDOWN_SECONDS;
+        s.countdown = net.countdown ?? COUNTDOWN_SECONDS;
       }
-
+      // Ready screen (lobby / matchOver), seated: the load-in lobby panel.
       if (net.slot >= 0 && (net.mode === "lobby" || net.mode === "matchOver")) {
-        state.showReady = true;
-        state.isHost = net.isHost;
-        state.difficulty = net.difficulty;
-        state.gameVariant = net.gameVariant;
-        state.triangleMotion = net.triangleMotion;
-        state.botFill = net.botFill;
-        state.matchOver = net.mode === "matchOver";
-        state.resultLine = state.matchOver ? this.lastResultLine || "Match over." : "";
-        state.rows = [...net.players]
-          .sort((a, b) => a.slot - b.slot)
-          .map((p) => ({
-            slot: p.slot,
-            name: p.name || `P${p.slot + 1}`,
-            isBot: p.isBot,
-            connected: p.connected,
-            ready: p.ready,
-            isSelf: p.slot === net.slot,
-            cssColor: this.players[p.slot]?.cssColor ?? "#ffffff"
-          }));
-        state.selfReady = net.self?.ready ?? false;
-        state.waitingFor = net.players.filter((p) => !p.isBot && p.connected && !p.ready).length;
+        s.showPanel = true;
+        s.matchOver = net.mode === "matchOver";
+        s.kicker = s.matchOver ? "Match over" : "Online lobby";
+        s.isHost = net.isHost;
+        s.rulesEditable = net.isHost;
+        s.difficulty = net.difficulty;
+        s.gameVariant = net.gameVariant;
+        s.triangleMotion = net.triangleMotion;
+        s.botFill = net.botFill;
+        s.resultLine = s.matchOver ? this.lastResultLine || "Match over." : "";
+        s.rows = this.sessionRowsFromNet(net);
+        s.selfReady = net.self?.ready ?? false;
+        s.waitingFor = net.players.filter((p) => !p.isBot && p.connected && !p.ready).length;
+        s.primaryAction = "ready";
+        s.primaryLabel = s.selfReady ? "Ready ✓ (Space to cancel)" : "Ready (Space)";
+        s.statusLine = !s.selfReady
+          ? "Press Space when you're ready."
+          : s.waitingFor > 0
+            ? `Waiting for ${s.waitingFor} more player${s.waitingFor === 1 ? "" : "s"}…`
+            : "All set — starting…";
       }
+      dispatch();
+      return;
     }
 
-    window.dispatchEvent(new CustomEvent<SessionUiState>("four-pong:session", { detail: state }));
+    // --- OFFLINE (server down / local dev): local hot-seat menu ---
+    if (this.mode !== "playing") {
+      s.showPanel = true;
+      s.offline = true;
+      s.rows = this.sessionRowsOffline();
+      if (this.mode === "paused") {
+        s.kicker = "Paused";
+        s.primaryAction = "resume";
+        s.primaryLabel = "Resume (M)";
+        s.statusLine = "Press M or Esc to resume.";
+      } else if (this.mode === "matchOver") {
+        s.kicker = "Match over";
+        s.rulesEditable = true; // you're the local host
+        s.primaryAction = "start";
+        s.primaryLabel = "Start Again";
+        s.statusLine = "Press Space or Start to play again.";
+      } else {
+        s.kicker = "Local play";
+        s.rulesEditable = true;
+        s.primaryAction = "start";
+        s.primaryLabel = "Start";
+        s.statusLine = "Server offline — local hot-seat. Press Start.";
+      }
+    }
+    dispatch();
+  }
+
+  /** Roster rows from the live server players (sorted by slot). */
+  private sessionRowsFromNet(net: NetClient): SessionRowState[] {
+    return [...net.players]
+      .sort((a, b) => a.slot - b.slot)
+      .map((p) => ({
+        slot: p.slot,
+        name: p.name || `P${p.slot + 1}`,
+        isBot: p.isBot,
+        connected: p.connected,
+        ready: p.ready,
+        isSelf: p.slot === net.slot,
+        cssColor: this.players[p.slot]?.cssColor ?? "#ffffff"
+      }));
+  }
+
+  /** Roster rows for the offline hot-seat menu (slot 0 = you, others bots if filled). */
+  private sessionRowsOffline(): SessionRowState[] {
+    return this.players.map((p, slot) => ({
+      slot,
+      name: slot === 0 ? this.playerName : `P${slot + 1}`,
+      isBot: slot !== 0 && this.botFill,
+      connected: slot === 0,
+      ready: false,
+      isSelf: slot === 0,
+      cssColor: p.cssColor
+    }));
   }
 }
 
@@ -2241,32 +2346,12 @@ const game = new Phaser.Game({
 const scoreStrip = document.querySelector<HTMLDivElement>("#score-strip")!;
 const statusChip = document.querySelector<HTMLDivElement>("#status-chip")!;
 const pauseButton = document.querySelector<HTMLButtonElement>("#pause-button")!;
-const menuOverlay = document.querySelector<HTMLDivElement>("#menu-overlay")!;
-const startButton = document.querySelector<HTMLButtonElement>("#start-button")!;
-const botToggleButton = document.querySelector<HTMLButtonElement>("#bot-toggle-button")!;
-const menuBotState = document.querySelector<HTMLSpanElement>("#menu-bot-state")!;
-const menuTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-menu-tab]"));
-const menuTabPanels = Array.from(document.querySelectorAll<HTMLDivElement>("[data-menu-panel]"));
-const difficultyButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-difficulty]"));
-const menuDifficultyState = document.querySelector<HTMLSpanElement>("#menu-difficulty-state")!;
-const gameVariantButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-game-variant]"));
-const menuGameVariantState = document.querySelector<HTMLSpanElement>("#menu-game-variant-state")!;
-const themeButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-theme-choice]"));
-const menuThemeState = document.querySelector<HTMLSpanElement>("#menu-theme-state")!;
-const triangleMotionButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-triangle-motion]"));
-const menuTriangleState = document.querySelector<HTMLSpanElement>("#menu-triangle-state")!;
-const musicVolumeInput = document.querySelector<HTMLInputElement>("#music-volume")!;
-const sfxVolumeInput = document.querySelector<HTMLInputElement>("#sfx-volume")!;
-const playerNameInput = document.querySelector<HTMLInputElement>("#player-name-input")!;
-const playerNameRandomButton = document.querySelector<HTMLButtonElement>("#player-name-random")!;
-const menuMusicVolume = document.querySelector<HTMLElement>("#menu-music-volume")!;
-const menuSfxVolume = document.querySelector<HTMLElement>("#menu-sfx-volume")!;
-const menuMusicState = document.querySelector<HTMLElement>("#menu-music-state")!;
 
-// --- Online session layer (Stage 2) -----------------------------------------
-// Spectator banner + ready panel + 3-2-1 countdown, injected next to the other
-// overlays and driven entirely by "four-pong:session" events from the scene.
-// Styled with the same dark panel tokens as the rest of the shell (styles.css).
+// --- Unified menu / online-session layer ------------------------------------
+// ONE panel (Players | Rules two columns + a nested Settings sub-view + a
+// contextual primary action) serves as the load-in lobby, the match-over screen,
+// the M-menu (paused), AND the offline hot-seat menu — plus the spectator banner
+// and 3-2-1 countdown. Injected here, driven by "four-pong:session" events.
 document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
   "beforeend",
   `<div id="session-overlay" hidden>
@@ -2275,43 +2360,85 @@ document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
       <span id="session-banner-text">LIVE — watching</span>
       <button id="session-join-button" type="button">Jump In (Space)</button>
     </div>
-    <div class="session-panel" id="session-ready-panel" role="dialog" aria-label="Online lobby" hidden>
-      <span class="mode-kicker" id="session-kicker">Online lobby</span>
-      <h2 id="session-result" hidden></h2>
-      <ul id="session-roster"></ul>
-      <div class="session-settings" id="session-settings">
-        <span class="session-settings-label" id="session-settings-label">Rules</span>
-        <div class="session-setting">
-          <span class="session-setting-name">CPU</span>
-          <div class="session-setting-options" data-setting="difficulty">
-            <button type="button" data-difficulty="easy">Easy</button>
-            <button type="button" data-difficulty="medium">Medium</button>
-            <button type="button" data-difficulty="hard">Hard</button>
+    <div class="session-panel" id="session-panel" role="dialog" aria-label="Menu" hidden>
+      <div id="session-main">
+        <span class="mode-kicker" id="session-kicker">Online lobby</span>
+        <h2 id="session-result" hidden></h2>
+        <div class="session-cols">
+          <div class="session-col">
+            <span class="session-col-label">Players</span>
+            <ul id="session-roster"></ul>
+          </div>
+          <div class="session-col">
+            <span class="session-col-label" id="session-settings-label">Rules</span>
+            <div class="session-settings" id="session-settings">
+              <div class="session-setting">
+                <span class="session-setting-name">CPU</span>
+                <div class="session-setting-options" data-setting="difficulty">
+                  <button type="button" data-difficulty="easy">Easy</button>
+                  <button type="button" data-difficulty="medium">Medium</button>
+                  <button type="button" data-difficulty="hard">Hard</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Mode</span>
+                <div class="session-setting-options" data-setting="gameVariant">
+                  <button type="button" data-game-variant="classic">Classic</button>
+                  <button type="button" data-game-variant="rotating">Orbit</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Triangle</span>
+                <div class="session-setting-options" data-setting="triangleMotion">
+                  <button type="button" data-triangle-motion="steady">Steady</button>
+                  <button type="button" data-triangle-motion="reactive">Reactive</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Bots</span>
+                <div class="session-setting-options">
+                  <button type="button" id="session-bots-button">Bots: On</button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="session-setting">
-          <span class="session-setting-name">Mode</span>
-          <div class="session-setting-options" data-setting="gameVariant">
-            <button type="button" data-game-variant="classic">Classic</button>
-            <button type="button" data-game-variant="rotating">Orbit</button>
+        <div class="session-actions">
+          <button id="session-settings-toggle" type="button" class="ghost">⚙ Settings</button>
+          <button id="session-primary" type="button">Ready (Space)</button>
+        </div>
+        <p id="session-status">Press Space when you're ready.</p>
+      </div>
+      <div id="session-settings-view" hidden>
+        <span class="mode-kicker">Settings</span>
+        <div class="settings-row">
+          <span class="settings-row-label">Theme</span>
+          <div class="theme-grid">
+            <button class="active" type="button" data-theme-choice="neon"><span class="theme-swatch neon"></span>Neon</button>
+            <button type="button" data-theme-choice="solar"><span class="theme-swatch solar"></span>Solar</button>
+            <button type="button" data-theme-choice="deepSea"><span class="theme-swatch deep-sea"></span>Deep Sea</button>
+            <button type="button" data-theme-choice="candy"><span class="theme-swatch candy"></span>Candy</button>
+            <button type="button" data-theme-choice="mono"><span class="theme-swatch mono"></span>Mono</button>
           </div>
         </div>
-        <div class="session-setting">
-          <span class="session-setting-name">Triangle</span>
-          <div class="session-setting-options" data-setting="triangleMotion">
-            <button type="button" data-triangle-motion="steady">Steady</button>
-            <button type="button" data-triangle-motion="reactive">Reactive</button>
+        <div class="settings-row">
+          <span class="settings-row-label">Audio</span>
+          <div class="settings-audio">
+            <label class="volume-row"><span>Music</span><input id="music-volume" type="range" min="0" max="100" value="2" /><em id="menu-music-volume">2%</em></label>
+            <label class="volume-row"><span>SFX</span><input id="sfx-volume" type="range" min="0" max="100" value="5" /><em id="menu-sfx-volume">5%</em></label>
           </div>
         </div>
-        <div class="session-setting">
-          <span class="session-setting-name">Bots</span>
-          <div class="session-setting-options">
-            <button type="button" id="session-bots-button">Bots: On</button>
+        <div class="settings-row">
+          <span class="settings-row-label">Name</span>
+          <div class="name-row">
+            <input id="player-name-input" type="text" maxlength="12" autocomplete="off" spellcheck="false" placeholder="Your name" aria-label="Your display name" />
+            <button type="button" id="player-name-random" aria-label="Pick a random name">Random</button>
           </div>
+        </div>
+        <div class="session-actions">
+          <button id="session-settings-back" type="button" class="ghost">← Back</button>
         </div>
       </div>
-      <button id="session-ready-button" type="button">Ready (Space)</button>
-      <p id="session-status">Press Space when you're ready.</p>
     </div>
     <div class="session-countdown" id="session-countdown" hidden>
       <span id="session-countdown-number">3</span>
@@ -2324,11 +2451,15 @@ const sessionOverlay = document.querySelector<HTMLDivElement>("#session-overlay"
 const sessionBanner = document.querySelector<HTMLDivElement>("#session-banner")!;
 const sessionBannerText = document.querySelector<HTMLSpanElement>("#session-banner-text")!;
 const sessionJoinButton = document.querySelector<HTMLButtonElement>("#session-join-button")!;
-const sessionReadyPanel = document.querySelector<HTMLDivElement>("#session-ready-panel")!;
+const sessionPanel = document.querySelector<HTMLDivElement>("#session-panel")!;
+const sessionMain = document.querySelector<HTMLDivElement>("#session-main")!;
+const sessionSettingsView = document.querySelector<HTMLDivElement>("#session-settings-view")!;
+const sessionSettingsToggle = document.querySelector<HTMLButtonElement>("#session-settings-toggle")!;
+const sessionSettingsBack = document.querySelector<HTMLButtonElement>("#session-settings-back")!;
 const sessionKicker = document.querySelector<HTMLSpanElement>("#session-kicker")!;
 const sessionResult = document.querySelector<HTMLHeadingElement>("#session-result")!;
 const sessionRoster = document.querySelector<HTMLUListElement>("#session-roster")!;
-const sessionReadyButton = document.querySelector<HTMLButtonElement>("#session-ready-button")!;
+const sessionPrimary = document.querySelector<HTMLButtonElement>("#session-primary")!;
 const sessionStatus = document.querySelector<HTMLParagraphElement>("#session-status")!;
 const sessionSettings = document.querySelector<HTMLDivElement>("#session-settings")!;
 const sessionSettingsLabel = document.querySelector<HTMLSpanElement>("#session-settings-label")!;
@@ -2336,6 +2467,14 @@ const sessionBotsButton = document.querySelector<HTMLButtonElement>("#session-bo
 const sessionCountdown = document.querySelector<HTMLDivElement>("#session-countdown")!;
 const sessionCountdownNumber = document.querySelector<HTMLSpanElement>("#session-countdown-number")!;
 const sessionCountdownHint = document.querySelector<HTMLSpanElement>("#session-countdown-hint")!;
+// Cosmetic controls now live inside the panel's nested Settings sub-view.
+const themeButtons = Array.from(sessionSettingsView.querySelectorAll<HTMLButtonElement>("[data-theme-choice]"));
+const musicVolumeInput = sessionSettingsView.querySelector<HTMLInputElement>("#music-volume")!;
+const sfxVolumeInput = sessionSettingsView.querySelector<HTMLInputElement>("#sfx-volume")!;
+const playerNameInput = sessionSettingsView.querySelector<HTMLInputElement>("#player-name-input")!;
+const playerNameRandomButton = sessionSettingsView.querySelector<HTMLButtonElement>("#player-name-random")!;
+const menuMusicVolume = sessionSettingsView.querySelector<HTMLElement>("#menu-music-volume")!;
+const menuSfxVolume = sessionSettingsView.querySelector<HTMLElement>("#menu-sfx-volume")!;
 
 window.addEventListener("four-pong:hud", (event) => {
   const state = (event as CustomEvent<HudState>).detail;
@@ -2362,56 +2501,18 @@ window.addEventListener("four-pong:hud", (event) => {
   statusChip.textContent = `${state.message} ${state.botFill ? "Bot fill on." : "Bot fill off."}`;
   pauseButton.textContent = state.mode === "paused" ? "Resume" : "Pause";
   pauseButton.disabled = state.mode === "menu" || state.mode === "matchOver";
-  // Hide the legacy offline menu card while playing AND while the online
-  // session screens own the overlay layer (ready panel/banner/countdown). The
-  // local pause card (mode "paused" → netSession false) still shows it.
-  menuOverlay.hidden = state.mode === "playing" || state.netSession;
-  startButton.textContent = state.mode === "paused" ? "Resume" : state.mode === "matchOver" ? "Start Again" : "Start";
-  botToggleButton.textContent = state.botFill ? "Bot Fill: On" : "Bot Fill: Off";
-  menuBotState.textContent = state.botFill ? "On" : "Off";
-  menuDifficultyState.textContent = titleCase(state.botDifficulty);
-  menuGameVariantState.textContent = state.gameVariant === "rotating" ? "Orbit" : "Classic";
-  menuThemeState.textContent = THEMES[state.themeId].name;
-  menuTriangleState.textContent = titleCase(state.triangleMotionMode);
-  const musicPercent = Math.round(state.musicVolume * 100);
-  const sfxPercent = Math.round(state.sfxVolume * 100);
-  musicVolumeInput.value = String(musicPercent);
-  sfxVolumeInput.value = String(sfxPercent);
-  menuMusicVolume.textContent = `${musicPercent}%`;
-  menuSfxVolume.textContent = `${sfxPercent}%`;
-  menuMusicState.textContent = `${musicPercent}%`;
-  // Don't clobber the field while the player is mid-edit.
-  if (document.activeElement !== playerNameInput) {
-    playerNameInput.value = state.playerName;
-  }
   document.body.dataset.theme = THEMES[state.themeId].shellTheme;
-  difficultyButtons.forEach((button) => {
-    const active = button.dataset.difficulty === state.botDifficulty;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  gameVariantButtons.forEach((button) => {
-    const active = button.dataset.gameVariant === state.gameVariant;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  themeButtons.forEach((button) => {
-    const active = button.dataset.themeChoice === state.themeId;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  triangleMotionButtons.forEach((button) => {
-    const active = button.dataset.triangleMotion === state.triangleMotionMode;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
 });
 
-// --- Online session renderer -------------------------------------------------
-// The scene emits "four-pong:session" on every HUD refresh (which, while
-// networked, is every frame) — memoize on the serialized state so the DOM only
-// changes when the session actually does.
+// --- Unified menu / session renderer -----------------------------------------
+// The scene emits "four-pong:session" on every HUD refresh; memoize on the
+// serialized state so the DOM only changes when the menu actually does.
 let lastSessionKey = "";
+let settingsOpen = false;
+function applySettingsView() {
+  sessionMain.hidden = settingsOpen;
+  sessionSettingsView.hidden = !settingsOpen;
+}
 
 window.addEventListener("four-pong:session", (event) => {
   const s = (event as CustomEvent<SessionUiState>).detail;
@@ -2421,10 +2522,17 @@ window.addEventListener("four-pong:session", (event) => {
   }
   lastSessionKey = key;
 
-  sessionOverlay.hidden = s.banner === "none" && !s.showReady && s.countdown === null;
+  sessionOverlay.hidden = s.banner === "none" && !s.showPanel && s.countdown === null;
   sessionBanner.hidden = s.banner === "none";
-  sessionReadyPanel.hidden = !s.showReady;
+  sessionPanel.hidden = !s.showPanel;
   sessionCountdown.hidden = s.countdown === null;
+
+  // Always start the panel on the main view; the nested Settings sub-view is a
+  // momentary drill-in that resets whenever the menu closes.
+  if (!s.showPanel && settingsOpen) {
+    settingsOpen = false;
+  }
+  applySettingsView();
 
   if (s.banner === "watching") {
     sessionBannerText.textContent = "LIVE — watching · press Space to jump in";
@@ -2434,19 +2542,23 @@ window.addEventListener("four-pong:session", (event) => {
     sessionJoinButton.hidden = true;
   }
 
-  if (s.showReady) {
-    sessionKicker.textContent = s.matchOver ? "Match over" : "Online lobby";
+  if (s.showPanel) {
+    sessionKicker.textContent = s.kicker;
     sessionResult.hidden = !s.matchOver;
     sessionResult.textContent = s.resultLine;
     sessionRoster.innerHTML = s.rows
       .map((row) => {
         const tag = row.isBot
           ? `<span class="tag bot">BOT</span>`
-          : !row.connected
-            ? `<span class="tag offline">OFFLINE</span>`
-            : row.ready
-              ? `<span class="tag ready">READY</span>`
-              : `<span class="tag waiting">&hellip;</span>`;
+          : s.offline
+            ? row.isSelf
+              ? `<span class="tag ready">YOU</span>`
+              : `<span class="tag offline">OPEN</span>`
+            : !row.connected
+              ? `<span class="tag offline">OFFLINE</span>`
+              : row.ready
+                ? `<span class="tag ready">READY</span>`
+                : `<span class="tag waiting">&hellip;</span>`;
         return `<li class="${row.isSelf ? "self" : ""}" style="--player-color: ${row.cssColor}">
           <span class="seat">P${row.slot + 1}</span>
           <span class="player-name">${escapeHtml(row.name)}${row.isSelf ? " (you)" : ""}</span>
@@ -2454,21 +2566,21 @@ window.addEventListener("four-pong:session", (event) => {
         </li>`;
       })
       .join("");
-    sessionReadyButton.textContent = s.selfReady ? "Ready ✓ (Space to cancel)" : "Ready (Space)";
-    sessionReadyButton.classList.toggle("armed", s.selfReady);
-    sessionStatus.textContent = !s.selfReady
-      ? "Press Space when you're ready."
-      : s.waitingFor > 0
-        ? `Waiting for ${s.waitingFor} more player${s.waitingFor === 1 ? "" : "s"}…`
-        : "All set — starting…";
 
-    // Rules controls: highlight the current value; the host gets interactive
-    // buttons, everyone else sees them as read-only chips.
-    const markSetting = (key: string, current: string) => {
-      sessionSettings.querySelectorAll<HTMLButtonElement>(`[data-setting="${key}"] button`).forEach((btn) => {
+    // Primary action button (Ready / Resume / Start), contextual.
+    sessionPrimary.hidden = s.primaryAction === "none";
+    sessionPrimary.textContent = s.primaryLabel;
+    sessionPrimary.dataset.action = s.primaryAction;
+    sessionPrimary.classList.toggle("armed", s.primaryAction === "ready" && s.selfReady);
+    sessionStatus.textContent = s.statusLine;
+
+    // Rules chips: highlight the current value; clickable only when editable
+    // (offline, or networked host on a ready screen).
+    const markSetting = (settingKey: string, current: string) => {
+      sessionSettings.querySelectorAll<HTMLButtonElement>(`[data-setting="${settingKey}"] button`).forEach((btn) => {
         const val = btn.dataset.difficulty ?? btn.dataset.gameVariant ?? btn.dataset.triangleMotion ?? "";
         btn.classList.toggle("active", val === current);
-        btn.disabled = !s.isHost;
+        btn.disabled = !s.rulesEditable;
       });
     };
     markSetting("difficulty", s.difficulty);
@@ -2476,9 +2588,31 @@ window.addEventListener("four-pong:session", (event) => {
     markSetting("triangleMotion", s.triangleMotion);
     sessionBotsButton.textContent = `Bots: ${s.botFill ? "On" : "Off"}`;
     sessionBotsButton.classList.toggle("active", s.botFill);
-    sessionBotsButton.disabled = !s.isHost;
-    sessionSettingsLabel.textContent = s.isHost ? "Rules — you're the host" : "Rules — host (P1) sets them";
-    sessionSettings.classList.toggle("readonly", !s.isHost);
+    sessionBotsButton.disabled = !s.rulesEditable;
+    sessionSettingsLabel.textContent = s.offline
+      ? "Rules"
+      : s.paused
+        ? "Rules — change between rounds"
+        : s.rulesEditable
+          ? "Rules — you're the host"
+          : "Rules — host (P1) sets them";
+    sessionSettings.classList.toggle("readonly", !s.rulesEditable);
+
+    // Cosmetic Settings sub-view (per-client; always editable).
+    themeButtons.forEach((btn) => {
+      const active = btn.dataset.themeChoice === s.themeId;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
+    });
+    const musicPct = Math.round(s.musicVolume * 100);
+    const sfxPct = Math.round(s.sfxVolume * 100);
+    musicVolumeInput.value = String(musicPct);
+    sfxVolumeInput.value = String(sfxPct);
+    menuMusicVolume.textContent = `${musicPct}%`;
+    menuSfxVolume.textContent = `${sfxPct}%`;
+    if (document.activeElement !== playerNameInput) {
+      playerNameInput.value = s.playerName;
+    }
   }
 
   if (s.countdown !== null) {
@@ -2499,13 +2633,32 @@ sessionJoinButton.addEventListener("click", () => {
   sessionJoinButton.blur(); // keep a later Space from re-clicking the button
 });
 
-sessionReadyButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:ready-toggle"));
-  sessionReadyButton.blur(); // Space must hit the window handler, not this button
+// One contextual primary button → Ready / Resume / Start depending on context.
+sessionPrimary.addEventListener("click", () => {
+  const action = sessionPrimary.dataset.action;
+  if (action === "ready") {
+    window.dispatchEvent(new Event("four-pong:ready-toggle"));
+  } else if (action === "resume") {
+    window.dispatchEvent(new Event("four-pong:toggle-pause"));
+  } else if (action === "start") {
+    window.dispatchEvent(new Event("four-pong:start"));
+  }
+  sessionPrimary.blur(); // Space must hit the window handler, not this button
 });
 
-// Ready-panel rule controls reuse the SAME four-pong:set-* events as the offline
-// menu; the scene's setters host-gate + route them to the server when networked.
+sessionSettingsToggle.addEventListener("click", () => {
+  settingsOpen = true;
+  applySettingsView();
+  sessionSettingsToggle.blur();
+});
+sessionSettingsBack.addEventListener("click", () => {
+  settingsOpen = false;
+  applySettingsView();
+  sessionSettingsBack.blur();
+});
+
+// Rule controls dispatch the SAME four-pong:set-* events as before; the scene's
+// setters host-gate + route them to the server when networked.
 sessionSettings.querySelectorAll<HTMLButtonElement>("[data-difficulty]").forEach((b) => {
   b.addEventListener("click", () => {
     const v = b.dataset.difficulty;
@@ -2538,57 +2691,13 @@ sessionBotsButton.addEventListener("click", () => {
   sessionBotsButton.blur();
 });
 
-startButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:start"));
-});
-
-botToggleButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:toggle-bots"));
-});
-
-menuTabs.forEach((button) => {
-  button.addEventListener("click", () => {
-    const target = button.dataset.menuTab;
-    menuTabs.forEach((entry) => entry.classList.toggle("active", entry === button));
-    menuTabPanels.forEach((panel) => {
-      panel.hidden = panel.dataset.menuPanel !== target;
-    });
-  });
-});
-
-difficultyButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const difficulty = button.dataset.difficulty;
-    if (difficulty === "easy" || difficulty === "medium" || difficulty === "hard") {
-      window.dispatchEvent(new CustomEvent<BotDifficulty>("four-pong:set-difficulty", { detail: difficulty }));
-    }
-  });
-});
-
-gameVariantButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const variant = button.dataset.gameVariant;
-    if (variant === "classic" || variant === "rotating") {
-      window.dispatchEvent(new CustomEvent<GameVariant>("four-pong:set-game-variant", { detail: variant }));
-    }
-  });
-});
-
 themeButtons.forEach((button) => {
   button.addEventListener("click", () => {
     const themeId = button.dataset.themeChoice;
     if (themeId && themeId in THEMES) {
       window.dispatchEvent(new CustomEvent<ThemeId>("four-pong:set-theme", { detail: themeId as ThemeId }));
     }
-  });
-});
-
-triangleMotionButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const mode = button.dataset.triangleMotion;
-    if (mode === "steady" || mode === "reactive") {
-      window.dispatchEvent(new CustomEvent<TriangleMotionMode>("four-pong:set-triangle-motion", { detail: mode }));
-    }
+    button.blur();
   });
 });
 

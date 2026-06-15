@@ -11,6 +11,20 @@ NOT this repo's `Feedback.md` (which is a stale, separate channel).**
 `ssh terrabyte@192.168.1.207 'docker exec arcade-api cat /data/feedback.ndjson'`
 and filter `gameId=four-ponq`).
 
+**Session 2026-06-15 (round 2) shipped the two follow-up items — LIVE:**
+6. **"M menu sucks / kill the ugly big 'Four Ponq' card"** → DELETED the legacy
+   `#menu-overlay`. The ONE menu is now the lobby-style **session panel** (two
+   columns: Players | Rules + a bottom bar) used for the load-in lobby, match-over,
+   the **M-menu (paused)**, AND the offline hot-seat menu. Cosmetics (theme /
+   music+sfx volume / display name) moved into a nested **⚙ Settings** sub-view
+   (horizontal rows, no scroll). One contextual primary button = Ready / Resume /
+   Start. All in `src/main.ts` (the injected `#session-overlay`, `emitSession`
+   now drives every context incl. paused+offline, the `four-pong:session`
+   renderer) + `index.html` (card removed) + `styles.css`
+   (`.session-cols` / `.session-actions` / `.settings-row` / `#session-settings-view`).
+7. **"Super charges too fast"** → `MAX_CHARGE` 4 → 7 (now 7 paddle hits to grab;
+   `CHARGE_READY_AT` = 6 follows automatically; verify-paddle Test 4 still green).
+
 **Session 2026-06-15 shipped the two newest hub-feedback items — LIVE, one deploy:**
 1. **"Reactive doesn't work / physics aren't physicing / lose a life to BS"** →
    ROOT CAUSE was a desync: the sim already swivels the reactive triangle on

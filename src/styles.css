@@ -825,9 +825,9 @@ body.arcade-home-active #session-overlay {
 }
 
 .session-panel {
-  width: min(400px, calc(100vw - 36px));
-  max-height: calc(100vh - 208px);
-  max-height: calc(100dvh - 208px);
+  width: min(640px, calc(100vw - 36px));
+  max-height: calc(100vh - 160px);
+  max-height: calc(100dvh - 160px);
   overflow-y: auto;
   padding: 22px;
   pointer-events: auto;
@@ -922,8 +922,8 @@ body.arcade-home-active #session-overlay {
   background: rgba(255, 255, 255, 0.06);
 }
 
-#session-ready-button {
-  width: 100%;
+#session-primary {
+  flex: 1 1 auto;
   min-height: 48px;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -936,11 +936,15 @@ body.arcade-home-active #session-overlay {
   box-shadow: 0 0 26px rgba(98, 230, 255, 0.24);
 }
 
-#session-ready-button:hover {
+#session-primary[hidden] {
+  display: none;
+}
+
+#session-primary:hover {
   filter: brightness(1.08);
 }
 
-#session-ready-button.armed {
+#session-primary.armed {
   color: var(--text);
   background: rgba(255, 255, 255, 0.08);
   border-color: var(--cool);
@@ -955,13 +959,10 @@ body.arcade-home-active #session-overlay {
   text-align: center;
 }
 
-/* Host-controlled rule chips on the ready panel. */
+/* Host-controlled rule chips, stacked in the panel's right (Rules) column. */
 .session-settings {
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
   display: grid;
-  gap: 6px;
+  gap: 8px;
 }
 
 .session-settings-label {
@@ -1023,6 +1024,104 @@ body.arcade-home-active #session-overlay {
 /* Non-host: rules are read-only chips — dim the options the host didn't pick. */
 .session-settings.readonly .session-setting-options button:disabled:not(.active) {
   opacity: 0.4;
+}
+
+/* --- Unified panel: two columns (Players | Rules), actions, nested Settings -- */
+#session-main[hidden],
+#session-settings-view[hidden] {
+  display: none;
+}
+
+.session-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 12px;
+  align-items: start;
+}
+
+.session-col {
+  min-width: 0;
+}
+
+.session-col-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.session-col #session-roster {
+  margin: 0;
+}
+
+.session-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 18px;
+}
+
+.session-actions .ghost {
+  flex: 0 0 auto;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.session-actions .ghost:hover {
+  border-color: var(--cool);
+}
+
+/* Nested Settings sub-view: each control on its own horizontal row, no scroll. */
+.settings-row {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.settings-row-label {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.settings-audio {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.settings-audio .volume-row {
+  margin: 0;
+}
+
+/* Five themes across in one row inside the Settings sub-view. */
+.settings-row .theme-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.settings-row .theme-grid button {
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  text-align: center;
+  padding: 7px 4px;
+  font-size: 0.64rem;
 }
 
 .session-countdown {
@@ -1188,5 +1287,19 @@ body.arcade-home-active #session-overlay {
     max-height: calc(100vh - 284px);
     max-height: calc(100dvh - 284px);
     padding: 18px;
+  }
+
+  /* Narrow screens: stack the two columns and the audio pair vertically. */
+  .session-cols {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .settings-audio {
+    grid-template-columns: 1fr;
+  }
+
+  .session-actions {
+    flex-wrap: wrap;
   }
 }

@@ -28,10 +28,10 @@ export const PADDLE_RELEASE_GAP = 2.5;
 export const PADDLE_CONCAVITY = 0.48;
 export const PADDLE_WING_LENGTH_MIN = 16;
 export const PADDLE_WING_LENGTH_RATIO = 0.045;
-// Saves needed before a player can grab/launch the ball (the "super"). At the
-// old value of 10 the grab was effectively unreachable in a single life, so the
-// mechanic never fired ("the ball won't even get pinched"). Tunable.
-export const MAX_CHARGE = 4;
+// Paddle hits needed before a player can grab/launch the ball (the "super").
+// addCharge() runs once per hit before the catch check, so this many hits = the
+// grab fires on the Nth hit. Player feedback: 4 charged too fast → 7 hits.
+export const MAX_CHARGE = 7;
 export const REPEAT_HIT_BOOST = 1.08;
 export const CATCH_DURATION = 3000;
 export const CATCH_LAUNCH_BOOST = 2;
