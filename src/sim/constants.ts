@@ -57,16 +57,26 @@ export const ARC_BARRIER_INSET = 6;
 export const ARC_BARRIER_THICKNESS = 15;
 
 // "Hollow Trinity" center shape (host-selectable alongside the solid triangle):
-// 3 shortened segments forming a hollow core with 3 corner-gap openings. For the
-// ball to thread a corner the centerline gap must clear BOTH wall capsules AND the
-// ball: gap >= 2*(BALL_RADIUS + HALF_THICKNESS) (the walls are HALF_THICKNESS-radius
-// capsules). The per-corner gap is (1-FRACTION)/2 * edgeLen = (1-FRACTION)/2 *
-// chamberRadius * sqrt(3); at R=82, FRACTION=0.44 that's ~40px vs the ~30px needed
-// (BALL_RADIUS 10 + HALF_THICKNESS 5) — comfortable passage, still tight enough to
-// rattle. Collision band is BALL_RADIUS + HALF_THICKNESS; drawn width is 2*HALF_THICKNESS.
-export const TRINITY_MIN_CHAMBER_RADIUS = 82;
-export const TRINITY_SEGMENT_FRACTION = 0.44;
+// 3 evenly-spaced concave ARCS forming a broken ring with 3 wide gaps. The ring
+// radius scales with the arena (a "good distance" from centre) inside a clamp; the
+// gaps are sized to clear ~2 ball diameters so a ball passes through easily. Each
+// arc spans TRINITY_ARC_SPAN of its 120° sector; the rest is the gap. The wall is a
+// HALF_THICKNESS-radius capsule (collision band = BALL_RADIUS + HALF_THICKNESS,
+// drawn width = 2*HALF_THICKNESS). The 3 arcs are anchored 120° apart and rotate on
+// the shared triangleRotation (Steady/Reactive), so the gaps sweep around.
+export const TRINITY_RING_RADIUS_FRAC = 0.34;
+export const TRINITY_RING_RADIUS_MIN = 84;
+export const TRINITY_RING_RADIUS_MAX = 150;
+// Base angular width of each arc (radians); a per-arc asymmetric skew is added in
+// geometry. 3 arcs 120° apart; gap = 120° − span. ~1.32 rad (~76°) arc → ~44° gap →
+// each gap clears ~2 balls even after the skew narrows the tightest one.
+export const TRINITY_ARC_SPAN = 1.32;
 export const TRINITY_SEGMENT_HALF_THICKNESS = 5;
+// Anti-trap escape valve: after this many consecutive ring bounces without the ball
+// leaving the ring (only reachable by a rare resonant orbit — never in real play),
+// rotate its heading by TRINITY_ESCAPE_KICK to break the orbit. Deterministic.
+export const TRINITY_ESCAPE_STREAK = 24;
+export const TRINITY_ESCAPE_KICK = 0.6;
 
 export const BOT_DIFFICULTY_SPEED: Record<BotDifficulty, number> = {
   easy: 0.42,

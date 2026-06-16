@@ -11,6 +11,7 @@
 import {
   TAU,
   Vec2,
+  angleInArc,
   clamp,
   cloneVec,
   closestPointOnSegment,
@@ -72,13 +73,15 @@ import {
   TRIANGLE_REACTIVE_MAX_SPEED,
   TRIANGLE_REACTIVE_MIN_SPEED,
   TRIANGLE_ROTATION_SPEED,
+  TRINITY_ESCAPE_KICK,
+  TRINITY_ESCAPE_STREAK,
   TRINITY_SEGMENT_HALF_THICKNESS
 } from "./constants";
 import {
   activePlayers,
   arcBarrierAngles,
+  centerArcs,
   centerChamberRadius,
-  centerSegments,
   clampPaddleToArc,
   paddleCatchPoint,
   paddleCenter,
@@ -116,6 +119,7 @@ export function createSimState(init?: {
     gameVariant: "classic",
     triangleMotionMode: "steady",
     centerShape: "triangle",
+    centerHitStreak: 0,
     triangleRotation: -Math.PI / 2,
     triangleAngularVelocity: TRIANGLE_ROTATION_SPEED,
     elapsed: 0,
@@ -356,6 +360,7 @@ function resetRoundInternal(state: SimState, arena: ArenaGeometry, rng: Rng, eve
   state.triangleCollisionDisabledUntil = state.elapsed + TRIANGLE_PHASE_DELAY;
   state.roundReadyAt = state.mode === "playing" ? state.elapsed + SPAWN_DELAY : 0;
   state.roundResolving = false;
+  state.centerHitStreak = 0;
   clearTouchState(state);
   clearCatchState(state);
   events.push({ kind: "serve", direction: normalizeVec(state.velocity) });
@@ -482,41 +487,84 @@ function handleTriangleCollision(state: SimState, arena: ArenaGeometry, events: 
 }
 
 /**
- * Hollow Trinity collision: 3 double-sided thin walls (capsules of half-thickness
- * TRINITY_SEGMENT_HALF_THICKNESS). The ball bounces off whichever side it
- * approaches and passes cleanly through the 3 corner gaps; it can rattle inside
- * before escaping. The collision band (BALL_RADIUS + halfThickness ≈ 17px) is
- * wider than the per-substep travel (≤ BALL_RADIUS*0.5 = 5px), so a wall can never
- * be tunnelled. Reuses the same reactive-impulse + reflect-only-when-incoming guard
- * as the solid triangle so the swivel and anti-jitter behaviour are identical.
+ * Hollow Trinity collision: a broken ring of 3 concave arcs (radius
+ * centerChamberRadius) with 3 wide gaps. The ball bounces off the ring wall
+ * (inner OR outer face — double-sided) wherever an arc covers its angle, and
+ * passes cleanly through the gaps; it can rattle inside before escaping. The arc
+ * ENDS are rounded caps so the ball can't clip through a gap edge. The collision
+ * band (BALL_RADIUS + halfThickness ≈ 15px) is wider than the per-substep travel
+ * (≤ 5px), so the wall can't be tunnelled. Reuses the solid triangle's
+ * reactive-impulse + reflect-only-when-incoming (anti-jitter) behaviour.
  */
 function handleTrinityCollision(state: SimState, arena: ArenaGeometry, events: SimEvent[]): void {
+  const ringRadius = centerChamberRadius(arena);
   const band = BALL_RADIUS + TRINITY_SEGMENT_HALF_THICKNESS;
-  for (const segment of centerSegments(arena, state.triangleRotation)) {
-    const closest = closestPointOnSegment(state.ball, segment.start, segment.end);
-    const delta = subVec(state.ball, closest);
-    const distance = lengthVec(delta);
-    if (distance >= band) {
-      continue;
-    }
+  const toBall = subVec(state.ball, arena.center);
+  const distance = lengthVec(toBall);
+  if (distance > ringRadius + band) {
+    state.centerHitStreak = 0; // out past the ring — escaped (or never entered)
+    return;
+  }
+  if (distance < ringRadius - band || distance < 1e-6) {
+    return; // in the hollow interior (between wall hits) or degenerate — no wall here
+  }
 
-    // Normal points from the wall toward the ball's side (double-sided). Degenerate
-    // dead-on hit (ball centred on the wall) falls back to the outward radial.
-    const normal = lengthSqVec(delta) > 0.0001
-      ? normalizeVecInPlace(delta)
-      : normalizeVecInPlace(subVec(state.ball, arena.center));
-    applyTriangleReactiveImpulse(state, arena, closest);
-    // Only reverse the ball if it's actually moving INTO the wall — prevents a
-    // just-reflected ball from being flipped again on the next substep.
+  const radial = { x: toBall.x / distance, y: toBall.y / distance };
+  const phi = normalizeAngle(Math.atan2(toBall.y, toBall.x));
+  const arcs = centerArcs(arena, state.triangleRotation);
+
+  const bounce = (normal: Vec2, contact: Vec2, eject: Vec2): void => {
+    applyTriangleReactiveImpulse(state, arena, contact);
     if (dotVec(state.velocity, normal) < 0) {
       reflectBall(state, normal);
     }
-    state.ball.x = closest.x + normal.x * (band + 0.5);
-    state.ball.y = closest.y + normal.y * (band + 0.5);
+    copyVec(state.ball, eject);
+    // Anti-trap escape valve: a ball that keeps bouncing off the ring without
+    // leaving (only a rare resonant orbit does this — never real play) gets its
+    // heading rotated to break the orbit. Deterministic; cosmetically invisible
+    // since it can't trigger in normal rallies.
+    state.centerHitStreak += 1;
+    if (state.centerHitStreak > TRINITY_ESCAPE_STREAK) {
+      const cos = Math.cos(TRINITY_ESCAPE_KICK);
+      const sin = Math.sin(TRINITY_ESCAPE_KICK);
+      const vx = state.velocity.x;
+      const vy = state.velocity.y;
+      state.velocity.x = vx * cos - vy * sin;
+      state.velocity.y = vx * sin + vy * cos;
+      state.centerHitStreak = 0;
+    }
     clearTouchState(state);
     state.lastTouchType = "triangle";
     events.push({ kind: "triangleHit" });
+  };
+
+  // Arc body: the ball is within an arc's angular span → reflect off the radial
+  // wall (outward normal if outside the ring, inward if inside).
+  for (const arc of arcs) {
+    if (!angleInArc(phi, arc.a0, arc.a1)) {
+      continue;
+    }
+    const sign = distance >= ringRadius ? 1 : -1;
+    const normal = { x: radial.x * sign, y: radial.y * sign };
+    const contact = { x: arena.center.x + radial.x * ringRadius, y: arena.center.y + radial.y * ringRadius };
+    const ejectR = ringRadius + sign * (band + 0.5);
+    bounce(normal, contact, { x: arena.center.x + radial.x * ejectR, y: arena.center.y + radial.y * ejectR });
     return;
+  }
+
+  // Rounded caps at the gap edges: bounce off the nearest arc endpoint.
+  for (const arc of arcs) {
+    for (const end of [arc.a0, arc.a1]) {
+      const cap = pointOnCircle(arena.center, end, ringRadius);
+      const delta = subVec(state.ball, cap);
+      const capDist = lengthVec(delta);
+      if (capDist >= band) {
+        continue;
+      }
+      const normal = lengthSqVec(delta) > 0.0001 ? normalizeVecInPlace(delta) : { x: radial.x, y: radial.y };
+      bounce(normal, cap, { x: cap.x + normal.x * (band + 0.5), y: cap.y + normal.y * (band + 0.5) });
+      return;
+    }
   }
 }
 

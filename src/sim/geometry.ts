@@ -22,8 +22,10 @@ import {
   PADDLE_RELEASE_GAP,
   PADDLE_WING_LENGTH_MIN,
   PADDLE_WING_LENGTH_RATIO,
-  TRINITY_MIN_CHAMBER_RADIUS,
-  TRINITY_SEGMENT_FRACTION
+  TRINITY_ARC_SPAN,
+  TRINITY_RING_RADIUS_FRAC,
+  TRINITY_RING_RADIUS_MAX,
+  TRINITY_RING_RADIUS_MIN
 } from "./constants";
 
 export interface PaddleOutlinePoint {
@@ -163,43 +165,35 @@ export function triangleVertices(arena: ArenaGeometry, rotation: number): Vec2[]
 }
 
 /**
- * Circumradius of the "Hollow Trinity" center shape. Larger than the solid
- * triangle's so the corner gaps clear the ball (see TRINITY_MIN_CHAMBER_RADIUS).
- * Shared by collision, the gravity guard, and rendering so they always agree.
+ * Radius of the "Hollow Trinity" broken ring — a "good distance" from centre that
+ * scales with the arena (clamped) so the gaps stay wide enough for ~2 balls and the
+ * interior has room to rattle. Shared by collision, the gravity guard, and the
+ * renderer so they always agree.
  */
 export function centerChamberRadius(arena: ArenaGeometry): number {
-  return Math.max(arena.triangleRadius, TRINITY_MIN_CHAMBER_RADIUS);
+  return Math.max(TRINITY_RING_RADIUS_MIN, Math.min(TRINITY_RING_RADIUS_MAX, arena.radius * TRINITY_RING_RADIUS_FRAC));
 }
 
-// Per-wall tilt (radians) about each segment's midpoint. Deliberately ASYMMETRIC
-// so the 3 walls aren't related by a 120° rotation: that breaks the stable medial
-// (edge-midpoint) billiard orbit a ball could otherwise settle into and never
-// escape. Small enough that the shape still reads as a hollow triangle.
-const TRINITY_WALL_TILTS = [0.18, -0.1, 0.05];
+// Per-arc span skew + centre offset (radians). Deliberately ASYMMETRIC so the 3
+// arcs aren't related by a 120° rotation — that breaks the symmetric billiard orbit
+// a ball could otherwise settle into inside the ring and never escape. Small enough
+// that the gaps stay wide (each still clears ~2 balls) and the shape still reads as
+// 3 evenly-spaced arcs.
+const TRINITY_ARC_SKEW = [0.16, -0.16, 0.05];
+const TRINITY_ARC_OFFSET = [0.08, -0.05, 0.0];
 
 /**
- * The 3 wall segments of the Hollow Trinity. Each is centered on a triangle-edge
- * midpoint on the chamber circumcircle (so the corners stay open as the 3 gaps the
- * ball passes through) but is the middle TRINITY_SEGMENT_FRACTION of the edge,
- * tilted by an asymmetric per-wall angle (see TRINITY_WALL_TILTS).
+ * The 3 arcs of the Hollow Trinity, as [a0, a1] angular spans on the ring circle
+ * (radius = centerChamberRadius). They are anchored 120° apart and centred on
+ * `rotation + i*120°` (with a small asymmetric offset), each ~TRINITY_ARC_SPAN wide
+ * (asymmetrically skewed); the remainder of each 120° sector is the gap the ball
+ * passes through.
  */
-export function centerSegments(arena: ArenaGeometry, rotation: number): { start: Vec2; end: Vec2 }[] {
-  const radius = centerChamberRadius(arena);
-  const verts = [0, 1, 2].map((index) => pointOnCircle(arena.center, rotation + index * TAU / 3, radius));
+export function centerArcs(_arena: ArenaGeometry, rotation: number): { a0: number; a1: number }[] {
   return [0, 1, 2].map((index) => {
-    const a = verts[index];
-    const b = verts[(index + 1) % 3];
-    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const halfLen = (Math.hypot(dx, dy) * TRINITY_SEGMENT_FRACTION) / 2;
-    const angle = Math.atan2(dy, dx) + TRINITY_WALL_TILTS[index];
-    const hx = Math.cos(angle) * halfLen;
-    const hy = Math.sin(angle) * halfLen;
-    return {
-      start: { x: mid.x - hx, y: mid.y - hy },
-      end: { x: mid.x + hx, y: mid.y + hy }
-    };
+    const center = rotation + index * TAU / 3 + TRINITY_ARC_OFFSET[index];
+    const half = (TRINITY_ARC_SPAN + TRINITY_ARC_SKEW[index]) / 2;
+    return { a0: center - half, a1: center + half };
   });
 }
 

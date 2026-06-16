@@ -30,28 +30,33 @@ and filter `gameId=four-ponq`).
    whole arena visibly spins (verified: zones swept clockwise between two play
    frames). Side effect (expected): non-top players see A/D screen-mirrored — noted
    in the "Orbit on" message.
-3. **"New center shape: 3 spaced segments, hollow core, 3 gap openings, ball rattles
-   inside"** → new host **Center: Triangle | Hollow** rule, rotates on the same
-   `triangleRotation`/Steady-Reactive machinery. `CenterShape` type + `SimState.centerShape`
-   (default triangle) plumbed through `shared/protocol.ts` (`setSetting` key +
-   `{t:"room"}`), `server/room.ts`, `src/net/client.ts`, `src/main.ts` (mirror +
-   lobby UI + setter/handler/listener). Geometry `centerSegments`/`centerChamberRadius`
-   in `src/sim/geometry.ts`; collision `handleTrinityCollision` (double-sided capsule
-   walls, reuse the reactive impulse + `dot(v,n)<0` anti-jitter guard) + a chamber
-   gravity cutoff in `applyTriangleGravity` (else the well traps the ball); render
-   `drawTrinity` in `src/main.ts`.
-   ⚠️ TWO real traps found+fixed while verifying: (a) sized the corner gap by the
-   bare centerline (26px) but the walls are 7px capsules — the *clear* opening was
-   only 12px < ball; widened to `chamber=82, frac=0.44, halfThickness=5` so the gap
-   (39.8) clears `2*(BALL_RADIUS+halfThickness)=30`. (b) a hollow equilateral triangle
-   has a STABLE medial (edge-midpoint) billiard orbit; the walls sat exactly on the
-   midpoints so a dead-center launch could orbit forever. Fixed by an ASYMMETRIC
-   per-wall tilt (`TRINITY_WALL_TILTS = [0.18,-0.1,0.05]`) that breaks the 3-fold
-   symmetry. Probe: 0/64 dead-center + 0/240 outside-entry traps in both spin modes.
+3. **"New center shape: hollow core, gap openings, ball rattles inside"** → new host
+   **Center: Triangle | Hollow** rule, rotates on the same `triangleRotation`/
+   Steady-Reactive machinery. `CenterShape` type + `SimState.centerShape` (default
+   triangle) plumbed through `shared/protocol.ts` (`setSetting` key + `{t:"room"}`),
+   `server/room.ts`, `src/net/client.ts`, `src/main.ts` (mirror + lobby UI +
+   setter/handler/listener).
+   **Owner follow-up = a BROKEN RING, not bars**: 3 evenly-spaced concave ARCS at a
+   "good distance" from centre (ring radius scales with the arena, `centerChamberRadius`
+   = `clamp(radius*0.34, 84, 150)`) with 3 WIDE gaps each clearing ~2 ball diameters.
+   `centerArcs(arena, rotation)` returns `[{a0,a1}]` (in `src/sim/geometry.ts`);
+   collision `handleTrinityCollision` = radial-band test within an arc's angular span
+   (double-sided: outward normal outside the ring, inward inside) + rounded endpoint
+   caps at the gap edges, reusing the reactive impulse + `dot(v,n)<0` anti-jitter
+   guard; in-ring `applyTriangleGravity` cutoff (else the well traps the ball at
+   centre); render `drawTrinity` strokes 3 arcs (`gfx.arc`) with round caps.
+   ⚠️ Trap-hardening (concentric arcs have stable billiard/whispering-gallery orbits):
+   ASYMMETRIC per-arc span skew + centre offset (`TRINITY_ARC_SKEW`/`TRINITY_ARC_OFFSET`
+   in geometry) breaks the 3-fold symmetry, AND a deterministic ESCAPE VALVE
+   (`SimState.centerHitStreak`: after `TRINITY_ESCAPE_STREAK=24` consecutive ring
+   bounces without leaving, rotate the heading by `TRINITY_ESCAPE_KICK=0.6` rad —
+   only a resonant orbit ever reaches that, so it's cosmetically invisible). Probe:
+   **0/360 dead-center + 0/360 outside-entry traps in both spin modes**; ball still
+   rattles up to ~27× before escaping. Gap clears 43px (min arena) → 76px (large).
 
 Tests: `verify-paddle.cjs` (added Test 8 — gap-free wing coverage + speed cap),
-`verify-triangle.cjs` (unchanged, green), new **`verify-center.cjs`** (corner gap ≥
-ball+walls at every arena size; rattles ≥2; escapes from 24 dirs × both spin modes).
+`verify-triangle.cjs` (unchanged, green), new **`verify-center.cjs`** (each gap clears
+2 balls at every arena size; rattles ≥2; escapes from 24 dirs × both spin modes).
 All three ALL PASS. 2-client headless Playwright: host set Center=Hollow + Mode=Orbit,
 non-host MIRRORED both (buttons disabled = host-only enforced), canvas renders, orbit
 visibly rotates (`playtest-hollow-orbit-{lobby,2ndclient,play1,play2}.png`). TUNABLES

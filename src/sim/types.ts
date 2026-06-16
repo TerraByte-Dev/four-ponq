@@ -68,6 +68,8 @@ export interface SimState {
   triangleMotionMode: TriangleMotionMode;
   /** Which center obstacle is in play. Rotates on the same triangleRotation/Steady-Reactive machinery. */
   centerShape: CenterShape;
+  /** Consecutive Hollow-Trinity ring bounces without leaving the ring — drives the anti-trap escape kick. */
+  centerHitStreak: number;
   triangleRotation: number;
   triangleAngularVelocity: number;
   elapsed: number;

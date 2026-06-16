@@ -15,13 +15,13 @@
  *      (the in-chamber gravity cutoff means the well can't pin it at dead-centre).
  */
 const { createSimState, advanceBall, stepTriangleMotion, applyTriangleGravity } = require("../dist-server/src/sim/physics.js");
-const { computeArena, rebuildArcs, centerSegments, centerChamberRadius } = require("../dist-server/src/sim/geometry.js");
+const { computeArena, rebuildArcs, centerArcs, centerChamberRadius } = require("../dist-server/src/sim/geometry.js");
 const { MAX_SHIELDS, BALL_RADIUS, BASE_BALL_SPEED, MAX_BALL_SPEED, TRINITY_SEGMENT_HALF_THICKNESS } = require("../dist-server/src/sim/constants.js");
 
-// A ball threading a corner must clear BOTH capsule wall-ends (radius
-// HALF_THICKNESS) and itself (BALL_RADIUS), so the centerline gap between the two
-// nearest wall endpoints must be >= 2*(BALL_RADIUS + HALF_THICKNESS).
-const REQUIRED_GAP = 2 * (BALL_RADIUS + TRINITY_SEGMENT_HALF_THICKNESS);
+// The design ask: each gap should clear ~2 balls. The clear tangential opening
+// between two arc-end caps (radius HALF_THICKNESS) is the chord between the
+// endpoints minus 2*HALF_THICKNESS; require it to fit 2 ball diameters.
+const REQUIRED_CLEAR = 4 * BALL_RADIUS;
 
 const DT = 1 / 60;
 
@@ -54,38 +54,39 @@ function check(name, ok, detail) {
 
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
-// Smallest opening between any two distinct walls = the corner gap the ball must
-// fit through. Measured as the min distance between endpoints of different segments.
-function minCornerGap(arena) {
-  const segs = centerSegments(arena, -Math.PI / 2);
-  const pts = segs.flatMap((s, i) => [{ ...s.start, seg: i }, { ...s.end, seg: i }]);
+// Clear opening of the tightest gap: the chord between adjacent arc endpoints on
+// the ring, minus the two end-cap radii (HALF_THICKNESS each).
+function minGapClear(arena) {
+  const R = centerChamberRadius(arena);
+  const c = arena.center;
+  const onRing = (a) => ({ x: c.x + Math.cos(a) * R, y: c.y + Math.sin(a) * R });
+  const arcs = centerArcs(arena, -Math.PI / 2);
   let min = Infinity;
-  for (let i = 0; i < pts.length; i += 1) {
-    for (let j = i + 1; j < pts.length; j += 1) {
-      if (pts[i].seg === pts[j].seg) continue;
-      min = Math.min(min, dist(pts[i], pts[j]));
-    }
+  for (let i = 0; i < arcs.length; i += 1) {
+    const next = arcs[(i + 1) % arcs.length];
+    const chord = dist(onRing(arcs[i].a1), onRing(next.a0));
+    min = Math.min(min, chord - 2 * TRINITY_SEGMENT_HALF_THICKNESS);
   }
   return min;
 }
 
 console.log("four-ponq Hollow Trinity centre shape\n");
 
-// --- Test 1: corner gaps clear the ball + walls at every arena size ----------
+// --- Test 1: each gap clears ~2 balls at every arena size --------------------
 {
-  console.log(`Test 1 — corner gaps >= 2*(BALL_RADIUS + wall) = ${REQUIRED_GAP} at every arena size`);
+  console.log(`Test 1 — every gap clears 2 ball diameters (>= ${REQUIRED_CLEAR}) at every arena size`);
   const viewports = [[320, 480], [960, 640], [1600, 1000]];
   let worst = Infinity;
   for (const [w, h] of viewports) {
     const arena = computeArena(w, h);
-    const gap = minCornerGap(arena);
-    worst = Math.min(worst, gap);
+    const clear = minGapClear(arena);
+    worst = Math.min(worst, clear);
     check(
-      `${w}x${h} (r=${arena.radius.toFixed(0)}, chamber=${centerChamberRadius(arena).toFixed(0)}): gap ${gap.toFixed(1)} >= ${REQUIRED_GAP}`,
-      gap >= REQUIRED_GAP - 1e-6
+      `${w}x${h} (r=${arena.radius.toFixed(0)}, ring=${centerChamberRadius(arena).toFixed(0)}): gap clear ${clear.toFixed(1)} >= ${REQUIRED_CLEAR}`,
+      clear >= REQUIRED_CLEAR - 1e-6
     );
   }
-  check(`tightest gap across all sizes clears ball + walls`, worst >= REQUIRED_GAP - 1e-6, `worst=${worst.toFixed(1)}`);
+  check(`tightest gap across all sizes fits 2 balls`, worst >= REQUIRED_CLEAR - 1e-6, `worst=${worst.toFixed(1)}`);
 }
 
 // --- Tests 2 & 3: the ball rattles inside, and always escapes (no trap) ------

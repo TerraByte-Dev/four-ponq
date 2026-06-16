@@ -21,7 +21,7 @@ import {
   TRIANGLE_ROTATION_SPEED,
   TRINITY_SEGMENT_HALF_THICKNESS
 } from "./sim/constants";
-import { centerSegments, computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
+import { centerArcs, centerChamberRadius, computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
 import {
   advanceBall,
   applyTriangleGravity,
@@ -1271,24 +1271,25 @@ class FourPongScene extends Phaser.Scene {
   }
 
   /**
-   * Hollow Trinity: 3 thick rounded bars with corner gaps. Drawn from the same
-   * interpolated rotation as the triangle so the rendered walls match the surface
-   * the authoritative ball bounces off. Wall thickness = 2*halfThickness, matching
-   * the collision capsule so the visual and the physics agree.
+   * Hollow Trinity: a broken ring of 3 concave arcs with 3 wide gaps. Drawn from
+   * the same interpolated rotation as the triangle so the rendered walls match the
+   * surface the authoritative ball bounces off. Stroke width = 2*halfThickness with
+   * rounded end caps, matching the collision capsule so visual and physics agree.
    */
   private drawTrinity(arena: ArenaGeometry, theme: ThemeDefinition, rotation: number) {
-    const segments = centerSegments(arena, rotation);
+    const ringRadius = centerChamberRadius(arena);
     const half = TRINITY_SEGMENT_HALF_THICKNESS;
     this.gfx.lineStyle(half * 2, theme.triangleStroke, 0.92);
     this.gfx.fillStyle(theme.triangleStroke, 0.92);
-    for (const segment of segments) {
+    for (const arc of centerArcs(arena, rotation)) {
       this.gfx.beginPath();
-      this.gfx.moveTo(segment.start.x, segment.start.y);
-      this.gfx.lineTo(segment.end.x, segment.end.y);
+      this.gfx.arc(arena.center.x, arena.center.y, ringRadius, arc.a0, arc.a1, false);
       this.gfx.strokePath();
-      // Rounded caps (Phaser strokes are butt-capped) so the bar ends read clean.
-      this.gfx.fillCircle(segment.start.x, segment.start.y, half);
-      this.gfx.fillCircle(segment.end.x, segment.end.y, half);
+      // Rounded caps at the gap edges (Phaser arc strokes are butt-capped).
+      const p0 = pointOnCircle(arena.center, arc.a0, ringRadius);
+      const p1 = pointOnCircle(arena.center, arc.a1, ringRadius);
+      this.gfx.fillCircle(p0.x, p0.y, half);
+      this.gfx.fillCircle(p1.x, p1.y, half);
     }
   }
 
