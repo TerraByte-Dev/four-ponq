@@ -21,7 +21,9 @@ import {
   PADDLE_CONCAVITY,
   PADDLE_RELEASE_GAP,
   PADDLE_WING_LENGTH_MIN,
-  PADDLE_WING_LENGTH_RATIO
+  PADDLE_WING_LENGTH_RATIO,
+  TRINITY_MIN_CHAMBER_RADIUS,
+  TRINITY_SEGMENT_FRACTION
 } from "./constants";
 
 export interface PaddleOutlinePoint {
@@ -158,6 +160,47 @@ export function paddleCollisionSegments(arena: ArenaGeometry, player: SimPlayer)
 
 export function triangleVertices(arena: ArenaGeometry, rotation: number): Vec2[] {
   return [0, 1, 2].map((index) => pointOnCircle(arena.center, rotation + index * TAU / 3, arena.triangleRadius));
+}
+
+/**
+ * Circumradius of the "Hollow Trinity" center shape. Larger than the solid
+ * triangle's so the corner gaps clear the ball (see TRINITY_MIN_CHAMBER_RADIUS).
+ * Shared by collision, the gravity guard, and rendering so they always agree.
+ */
+export function centerChamberRadius(arena: ArenaGeometry): number {
+  return Math.max(arena.triangleRadius, TRINITY_MIN_CHAMBER_RADIUS);
+}
+
+// Per-wall tilt (radians) about each segment's midpoint. Deliberately ASYMMETRIC
+// so the 3 walls aren't related by a 120° rotation: that breaks the stable medial
+// (edge-midpoint) billiard orbit a ball could otherwise settle into and never
+// escape. Small enough that the shape still reads as a hollow triangle.
+const TRINITY_WALL_TILTS = [0.18, -0.1, 0.05];
+
+/**
+ * The 3 wall segments of the Hollow Trinity. Each is centered on a triangle-edge
+ * midpoint on the chamber circumcircle (so the corners stay open as the 3 gaps the
+ * ball passes through) but is the middle TRINITY_SEGMENT_FRACTION of the edge,
+ * tilted by an asymmetric per-wall angle (see TRINITY_WALL_TILTS).
+ */
+export function centerSegments(arena: ArenaGeometry, rotation: number): { start: Vec2; end: Vec2 }[] {
+  const radius = centerChamberRadius(arena);
+  const verts = [0, 1, 2].map((index) => pointOnCircle(arena.center, rotation + index * TAU / 3, radius));
+  return [0, 1, 2].map((index) => {
+    const a = verts[index];
+    const b = verts[(index + 1) % 3];
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const halfLen = (Math.hypot(dx, dy) * TRINITY_SEGMENT_FRACTION) / 2;
+    const angle = Math.atan2(dy, dx) + TRINITY_WALL_TILTS[index];
+    const hx = Math.cos(angle) * halfLen;
+    const hy = Math.sin(angle) * halfLen;
+    return {
+      start: { x: mid.x - hx, y: mid.y - hy },
+      end: { x: mid.x + hx, y: mid.y + hy }
+    };
+  });
 }
 
 export function activePlayers<T extends SimPlayer>(players: T[]): T[] {

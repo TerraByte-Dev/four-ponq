@@ -12,7 +12,7 @@
  */
 const { createSimState, advanceBall } = require("../dist-server/src/sim/physics.js");
 const { computeArena, rebuildArcs } = require("../dist-server/src/sim/geometry.js");
-const { MAX_CHARGE, MAX_SHIELDS, BASE_BALL_SPEED, PADDLE_MIN_INWARD } = require("../dist-server/src/sim/constants.js");
+const { MAX_CHARGE, MAX_SHIELDS, BASE_BALL_SPEED, MAX_BALL_SPEED, PADDLE_MIN_INWARD } = require("../dist-server/src/sim/constants.js");
 
 const arena = computeArena(960, 640);
 const DT = 1 / 60;
@@ -184,6 +184,28 @@ console.log(`four-ponq paddle physics — arena r=${arena.radius.toFixed(0)}, pa
   const a = fireShot({ angle: paddleAngle + 0.1, stopOn: (b) => hitP1(b) || goalAny(b) });
   const b = fireShot({ angle: paddleAngle + 0.1, stopOn: (b) => hitP1(b) || goalAny(b) });
   check("same shot twice → identical exit velocity", a.velocity.x === b.velocity.x && a.velocity.y === b.velocity.y);
+}
+
+// --- Test 8: wing coverage is gap-free + exit speed never exceeds the cap ------
+// The BALL_RADIUS-aware back-arc cutoff must catch balls grazing the wing flank
+// ("shoots through beside the paddle") WITHOUT leaving a hole inside the defended
+// band (a hit→miss→hit gap = a ball passing through the paddle). Sweep the arc
+// from the centre outward: the hit region must be a single contiguous prefix.
+{
+  console.log("\nTest 8 — gap-free wing coverage + speed cap (700)");
+  const offsets = [];
+  for (let d = 0; d <= 0.45 + 1e-9; d += 0.03) offsets.push(Number(d.toFixed(2)));
+  const results = offsets.map((d) => {
+    const { events, velocity } = fireShot({ angle: paddleAngle + d, stopOn: (b) => hitP1(b) || goalAny(b) });
+    return { d, hit: events.some((e) => e.kind === "paddleHit" && e.playerId === 1), speed: Math.hypot(velocity.x, velocity.y) };
+  });
+  const firstMiss = results.findIndex((r) => !r.hit);
+  const gapAfterMiss = firstMiss >= 0 && results.slice(firstMiss).some((r) => r.hit);
+  const wing = results.find((r) => Math.abs(r.d - 0.27) < 1e-9);
+  check("a wing-flank shot (d=+0.27) registers instead of passing through", !!wing && wing.hit);
+  check("defended band is contiguous — no hit→miss→hit hole", !gapAfterMiss);
+  const overCap = results.find((r) => r.speed > MAX_BALL_SPEED + 1e-6);
+  check(`every exit speed <= MAX_BALL_SPEED (${MAX_BALL_SPEED})`, !overCap, overCap ? `speed=${overCap.speed.toFixed(1)} at d=${overCap.d}` : undefined);
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);

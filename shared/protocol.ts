@@ -29,7 +29,7 @@
 
 // Gameplay-setting value unions, shared verbatim with the sim. Type-only import
 // (compiles away) — keeps protocol.ts runtime-dependency-free for both tsconfigs.
-import type { BotDifficulty, GameVariant, TriangleMotionMode } from "../src/sim/types";
+import type { BotDifficulty, CenterShape, GameVariant, TriangleMotionMode } from "../src/sim/types";
 
 /** Server simulation steps per second. */
 export const SIM_HZ = 60;
@@ -76,7 +76,7 @@ export type ClientMsg =
    * applies it to the authoritative sim and echoes the value back in {t:"room"}.
    * (Theme is intentionally absent — it stays a per-client cosmetic preference.)
    */
-  | { t: "setSetting"; key: "difficulty" | "gameVariant" | "triangleMotion"; value: string };
+  | { t: "setSetting"; key: "difficulty" | "gameVariant" | "triangleMotion" | "centerShape"; value: string };
 
 // ---------------------------------------------------------------------------
 // Shared view types
@@ -138,6 +138,7 @@ export type ServerMsg =
       difficulty: BotDifficulty;
       gameVariant: GameVariant;
       triangleMotion: TriangleMotionMode;
+      centerShape: CenterShape;
       countdown?: number;
     }
   /** Join acknowledged but deferred — you'll be seated at the next serve. */

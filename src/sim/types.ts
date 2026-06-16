@@ -10,6 +10,8 @@ export type BotDifficulty = "easy" | "medium" | "hard";
 export type TouchType = "none" | "player" | "triangle";
 export type TriangleMotionMode = "steady" | "reactive";
 export type GameVariant = "classic" | "rotating";
+/** The center obstacle: the classic solid triangle, or the hollow 3-segment "trinity". */
+export type CenterShape = "triangle" | "trinity";
 
 /** rng() returns a float in [0, 1) — inject a seeded one for deterministic replays. */
 export type Rng = () => number;
@@ -64,6 +66,8 @@ export interface SimState {
   botDifficulty: BotDifficulty;
   gameVariant: GameVariant;
   triangleMotionMode: TriangleMotionMode;
+  /** Which center obstacle is in play. Rotates on the same triangleRotation/Steady-Reactive machinery. */
+  centerShape: CenterShape;
   triangleRotation: number;
   triangleAngularVelocity: number;
   elapsed: number;

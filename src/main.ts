@@ -4,6 +4,7 @@ import { TAU, pointOnCircle, shortestAngleDelta, type Vec2 } from "./sim/math";
 import type {
   ArenaGeometry,
   BotDifficulty,
+  CenterShape,
   GameMode,
   GameVariant,
   PlayerInput,
@@ -17,9 +18,10 @@ import {
   MAX_BALL_SPEED,
   MAX_CHARGE,
   MAX_SHIELDS,
-  TRIANGLE_ROTATION_SPEED
+  TRIANGLE_ROTATION_SPEED,
+  TRINITY_SEGMENT_HALF_THICKNESS
 } from "./sim/constants";
-import { computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
+import { centerSegments, computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
 import {
   advanceBall,
   applyTriangleGravity,
@@ -137,6 +139,7 @@ interface SessionUiState {
   difficulty: BotDifficulty;
   gameVariant: GameVariant;
   triangleMotion: TriangleMotionMode;
+  centerShape: CenterShape;
   botFill: boolean;
   /** Per-client cosmetics, shown in the nested Settings sub-view. */
   themeId: ThemeId;
@@ -469,6 +472,14 @@ class FourPongScene extends Phaser.Scene {
     this.sim.triangleMotionMode = value;
   }
 
+  private get centerShape(): CenterShape {
+    return this.sim.centerShape;
+  }
+
+  private set centerShape(value: CenterShape) {
+    this.sim.centerShape = value;
+  }
+
   /**
    * Render-facing index of the LOCAL player among this.players: slot 0 offline
    * (the lone human), the net seat online, -1 for spectators. Used to mark
@@ -514,6 +525,7 @@ class FourPongScene extends Phaser.Scene {
     window.addEventListener("four-pong:toggle-bots", this.handleBotEvent);
     window.addEventListener("four-pong:set-difficulty", this.handleDifficultyEvent);
     window.addEventListener("four-pong:set-game-variant", this.handleGameVariantEvent);
+    window.addEventListener("four-pong:set-center-shape", this.handleCenterShapeEvent);
     window.addEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.addEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.addEventListener("four-pong:set-volume", this.handleVolumeEvent);
@@ -676,6 +688,7 @@ class FourPongScene extends Phaser.Scene {
       this.botDifficulty = net.difficulty;
       this.gameVariant = net.gameVariant;
       this.triangleMotionMode = net.triangleMotion;
+      this.centerShape = net.centerShape;
     }
 
     this.pushArcadeRoster();
@@ -781,6 +794,7 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("four-pong:toggle-bots", this.handleBotEvent);
     window.removeEventListener("four-pong:set-difficulty", this.handleDifficultyEvent);
     window.removeEventListener("four-pong:set-game-variant", this.handleGameVariantEvent);
+    window.removeEventListener("four-pong:set-center-shape", this.handleCenterShapeEvent);
     window.removeEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.removeEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.removeEventListener("four-pong:set-volume", this.handleVolumeEvent);
@@ -1132,6 +1146,13 @@ class FourPongScene extends Phaser.Scene {
    * already sits up top (slot 0) — those keep the default, un-rotated view.
    */
   private targetViewRotation(): number {
+    // Orbit mode: keep the camera FIXED so the sim's arena rotation
+    // (updateArenaRotation) is actually visible. Pinning the local arc to
+    // screen-top — what we do in classic — would exactly cancel the spin and
+    // the map would look static (the "orbit doesn't rotate the map" feedback).
+    if (this.gameVariant === "rotating") {
+      return 0;
+    }
     const net = this.net;
     if (!this.networked || !net || net.slot < 0) {
       return 0;
@@ -1218,11 +1239,15 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private drawTriangle(arena: ArenaGeometry, theme: ThemeDefinition) {
-    // Networked: render the interpolated SERVER pose so the drawn triangle is the
-    // exact surface the authoritative ball bounces off. Offline: local sim spin.
+    // Networked: render the interpolated SERVER pose so the drawn centre piece is
+    // the exact surface the authoritative ball bounces off. Offline: local sim spin.
     const rotation = this.networked && this.netTriangleRotation !== null
       ? this.netTriangleRotation
       : this.sim.triangleRotation;
+    if (this.centerShape === "trinity") {
+      this.drawTrinity(arena, theme, rotation);
+      return;
+    }
     const vertices = triangleVertices(arena, rotation);
     this.gfx.fillStyle(theme.triangleFill, 1);
     this.gfx.lineStyle(2, theme.triangleStroke, 0.62);
@@ -1243,6 +1268,28 @@ class FourPongScene extends Phaser.Scene {
     this.gfx.moveTo(arena.center.x, arena.center.y);
     this.gfx.lineTo(vertices[2].x, vertices[2].y);
     this.gfx.strokePath();
+  }
+
+  /**
+   * Hollow Trinity: 3 thick rounded bars with corner gaps. Drawn from the same
+   * interpolated rotation as the triangle so the rendered walls match the surface
+   * the authoritative ball bounces off. Wall thickness = 2*halfThickness, matching
+   * the collision capsule so the visual and the physics agree.
+   */
+  private drawTrinity(arena: ArenaGeometry, theme: ThemeDefinition, rotation: number) {
+    const segments = centerSegments(arena, rotation);
+    const half = TRINITY_SEGMENT_HALF_THICKNESS;
+    this.gfx.lineStyle(half * 2, theme.triangleStroke, 0.92);
+    this.gfx.fillStyle(theme.triangleStroke, 0.92);
+    for (const segment of segments) {
+      this.gfx.beginPath();
+      this.gfx.moveTo(segment.start.x, segment.start.y);
+      this.gfx.lineTo(segment.end.x, segment.end.y);
+      this.gfx.strokePath();
+      // Rounded caps (Phaser strokes are butt-capped) so the bar ends read clean.
+      this.gfx.fillCircle(segment.start.x, segment.start.y, half);
+      this.gfx.fillCircle(segment.end.x, segment.end.y, half);
+    }
   }
 
   private drawPaddles(arena: ArenaGeometry) {
@@ -1864,7 +1911,20 @@ class FourPongScene extends Phaser.Scene {
       return;
     }
     this.gameVariant = variant;
-    this.message = variant === "rotating" ? "Orbit mode on. The whole circle rotates clockwise." : "Classic mode on. The arena holds steady.";
+    this.message = variant === "rotating" ? "Orbit mode on. The whole circle rotates clockwise — your paddle rides around with it." : "Classic mode on. The arena holds steady.";
+    this.emitHud();
+  }
+
+  private setCenterShape(shape: CenterShape) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("centerShape", shape);
+      return;
+    }
+    this.centerShape = shape;
+    this.message = shape === "trinity" ? "Center set to Hollow Trinity — bank shots through the gaps." : "Center set to the classic triangle.";
     this.emitHud();
   }
 
@@ -2008,6 +2068,13 @@ class FourPongScene extends Phaser.Scene {
     const variant = (event as CustomEvent<GameVariant>).detail;
     if (variant === "classic" || variant === "rotating") {
       this.setGameVariant(variant);
+    }
+  };
+
+  private handleCenterShapeEvent = (event: Event) => {
+    const shape = (event as CustomEvent<CenterShape>).detail;
+    if (shape === "triangle" || shape === "trinity") {
+      this.setCenterShape(shape);
     }
   };
 
@@ -2195,6 +2262,7 @@ class FourPongScene extends Phaser.Scene {
       difficulty: this.botDifficulty,
       gameVariant: this.gameVariant,
       triangleMotion: this.triangleMotionMode,
+      centerShape: this.centerShape,
       botFill: this.botFill,
       themeId: this.themeId,
       musicVolume: this.musicVolume,
@@ -2219,6 +2287,7 @@ class FourPongScene extends Phaser.Scene {
         s.difficulty = net.difficulty;
         s.gameVariant = net.gameVariant;
         s.triangleMotion = net.triangleMotion;
+        s.centerShape = net.centerShape;
         s.botFill = net.botFill;
         dispatch();
         return;
@@ -2241,6 +2310,7 @@ class FourPongScene extends Phaser.Scene {
         s.difficulty = net.difficulty;
         s.gameVariant = net.gameVariant;
         s.triangleMotion = net.triangleMotion;
+        s.centerShape = net.centerShape;
         s.botFill = net.botFill;
         s.resultLine = s.matchOver ? this.lastResultLine || "Match over." : "";
         s.rows = this.sessionRowsFromNet(net);
@@ -2397,6 +2467,13 @@ document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
                 <div class="session-setting-options" data-setting="triangleMotion">
                   <button type="button" data-triangle-motion="steady">Steady</button>
                   <button type="button" data-triangle-motion="reactive">Reactive</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Center</span>
+                <div class="session-setting-options" data-setting="centerShape">
+                  <button type="button" data-center-shape="triangle">Triangle</button>
+                  <button type="button" data-center-shape="trinity">Hollow</button>
                 </div>
               </div>
               <div class="session-setting">
@@ -2583,7 +2660,7 @@ window.addEventListener("four-pong:session", (event) => {
     // (offline, or networked host on a ready screen).
     const markSetting = (settingKey: string, current: string) => {
       sessionSettings.querySelectorAll<HTMLButtonElement>(`[data-setting="${settingKey}"] button`).forEach((btn) => {
-        const val = btn.dataset.difficulty ?? btn.dataset.gameVariant ?? btn.dataset.triangleMotion ?? "";
+        const val = btn.dataset.difficulty ?? btn.dataset.gameVariant ?? btn.dataset.triangleMotion ?? btn.dataset.centerShape ?? "";
         btn.classList.toggle("active", val === current);
         btn.disabled = !s.rulesEditable;
       });
@@ -2591,6 +2668,7 @@ window.addEventListener("four-pong:session", (event) => {
     markSetting("difficulty", s.difficulty);
     markSetting("gameVariant", s.gameVariant);
     markSetting("triangleMotion", s.triangleMotion);
+    markSetting("centerShape", s.centerShape);
     sessionBotsButton.textContent = `Bots: ${s.botFill ? "On" : "Off"}`;
     sessionBotsButton.classList.toggle("active", s.botFill);
     sessionBotsButton.disabled = !s.rulesEditable;
@@ -2678,6 +2756,15 @@ sessionSettings.querySelectorAll<HTMLButtonElement>("[data-game-variant]").forEa
     const v = b.dataset.gameVariant;
     if (v === "classic" || v === "rotating") {
       window.dispatchEvent(new CustomEvent<GameVariant>("four-pong:set-game-variant", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-center-shape]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.centerShape;
+    if (v === "triangle" || v === "trinity") {
+      window.dispatchEvent(new CustomEvent<CenterShape>("four-pong:set-center-shape", { detail: v }));
     }
     b.blur();
   });

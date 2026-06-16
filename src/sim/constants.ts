@@ -32,7 +32,9 @@ export const PADDLE_WING_LENGTH_RATIO = 0.045;
 // addCharge() runs once per hit before the catch check, so this many hits = the
 // grab fires on the Nth hit. Player feedback: 4 charged too fast → 7 hits.
 export const MAX_CHARGE = 7;
-export const REPEAT_HIT_BOOST = 1.08;
+// Per-rally consecutive-hit acceleration. Player feedback ("ball a lil too fast")
+// → gentled 1.08 → 1.05 so rallies ramp more slowly.
+export const REPEAT_HIT_BOOST = 1.05;
 export const CATCH_DURATION = 3000;
 export const CATCH_LAUNCH_BOOST = 2;
 export const SPAWN_DELAY = 850;
@@ -46,11 +48,25 @@ export const PADDLE_ASSIST_ACCELERATION = 6.5;
 export const PADDLE_ASSIST_DECELERATION = 9.5;
 export const ROTATING_VARIANT_PADDLE_SPEED_BOOST = 1.05;
 export const ARENA_ROTATION_SPEED = 0.18;
-export const MAX_BALL_SPEED = 840;
-export const MAX_CHARGED_BALL_SPEED = 980;
+// Rally speed cap. Feedback: "ball a lil too fast" → 840 → 700. MAX_CHARGED must
+// stay strictly above this so a charged launch still out-runs a capped rally.
+export const MAX_BALL_SPEED = 700;
+export const MAX_CHARGED_BALL_SPEED = 820;
 export const ARC_BARRIER_HALF_ANGLE = 0.04125;
 export const ARC_BARRIER_INSET = 6;
 export const ARC_BARRIER_THICKNESS = 15;
+
+// "Hollow Trinity" center shape (host-selectable alongside the solid triangle):
+// 3 shortened segments forming a hollow core with 3 corner-gap openings. For the
+// ball to thread a corner the centerline gap must clear BOTH wall capsules AND the
+// ball: gap >= 2*(BALL_RADIUS + HALF_THICKNESS) (the walls are HALF_THICKNESS-radius
+// capsules). The per-corner gap is (1-FRACTION)/2 * edgeLen = (1-FRACTION)/2 *
+// chamberRadius * sqrt(3); at R=82, FRACTION=0.44 that's ~40px vs the ~30px needed
+// (BALL_RADIUS 10 + HALF_THICKNESS 5) — comfortable passage, still tight enough to
+// rattle. Collision band is BALL_RADIUS + HALF_THICKNESS; drawn width is 2*HALF_THICKNESS.
+export const TRINITY_MIN_CHAMBER_RADIUS = 82;
+export const TRINITY_SEGMENT_FRACTION = 0.44;
+export const TRINITY_SEGMENT_HALF_THICKNESS = 5;
 
 export const BOT_DIFFICULTY_SPEED: Record<BotDifficulty, number> = {
   easy: 0.42,

@@ -22,7 +22,7 @@
 
 import type { ClientMsg, ServerMsg, PlayerView, RoomMode } from "../../shared/protocol";
 import { SNAP_HZ, MAX_PLAYERS, COUNTDOWN_SECONDS } from "../../shared/protocol";
-import type { BotDifficulty, GameVariant, TriangleMotionMode } from "../sim/types";
+import type { BotDifficulty, CenterShape, GameVariant, TriangleMotionMode } from "../sim/types";
 import { TAU } from "../sim/math";
 
 // Re-export the session-layer types/constants main.ts needs so the scene keeps
@@ -123,6 +123,7 @@ export class NetClient {
   private _difficulty: BotDifficulty = "medium";
   private _gameVariant: GameVariant = "classic";
   private _triangleMotion: TriangleMotionMode = "steady";
+  private _centerShape: CenterShape = "triangle";
   /** Seconds remaining in the ready-screen countdown (mode === "countdown" only). */
   private _countdown: number | undefined;
   /** True between {t:"joinPending"} and the deferred {t:"seated"} at next serve. */
@@ -243,7 +244,7 @@ export class NetClient {
   }
 
   /** Host-only shared gameplay setting change (server enforces host + ready-screen). */
-  sendSetting(key: "difficulty" | "gameVariant" | "triangleMotion", value: string): void {
+  sendSetting(key: "difficulty" | "gameVariant" | "triangleMotion" | "centerShape", value: string): void {
     this.send({ t: "setSetting", key, value });
   }
 
@@ -282,6 +283,7 @@ export class NetClient {
         this._difficulty = msg.difficulty;
         this._gameVariant = msg.gameVariant;
         this._triangleMotion = msg.triangleMotion;
+        this._centerShape = msg.centerShape;
         this._countdown = msg.mode === "countdown" ? msg.countdown : undefined;
         this.opts.onChange?.();
         break;
@@ -494,6 +496,9 @@ export class NetClient {
   }
   get triangleMotion(): TriangleMotionMode {
     return this._triangleMotion;
+  }
+  get centerShape(): CenterShape {
+    return this._centerShape;
   }
   /** Seconds left in the 3-2-1 (only meaningful while mode === "countdown"). */
   get countdown(): number | undefined {

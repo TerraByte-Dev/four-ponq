@@ -574,6 +574,8 @@ export class Room {
       this.sim.gameVariant = value;
     } else if (key === "triangleMotion" && (value === "steady" || value === "reactive")) {
       this.sim.triangleMotionMode = value;
+    } else if (key === "centerShape" && (value === "triangle" || value === "trinity")) {
+      this.sim.centerShape = value;
     } else {
       return; // unknown key/value — ignore, don't broadcast
     }
@@ -872,7 +874,8 @@ export class Room {
       hostSlot: this.hostSlot(),
       difficulty: this.sim.botDifficulty,
       gameVariant: this.sim.gameVariant,
-      triangleMotion: this.sim.triangleMotionMode
+      triangleMotion: this.sim.triangleMotionMode,
+      centerShape: this.sim.centerShape
     };
     if (this.roomMode === "countdown") {
       msg.countdown = this.countdownLeft;

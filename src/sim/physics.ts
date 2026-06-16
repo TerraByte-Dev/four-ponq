@@ -71,11 +71,14 @@ import {
   TRIANGLE_REACTIVE_IMPULSE_GAIN,
   TRIANGLE_REACTIVE_MAX_SPEED,
   TRIANGLE_REACTIVE_MIN_SPEED,
-  TRIANGLE_ROTATION_SPEED
+  TRIANGLE_ROTATION_SPEED,
+  TRINITY_SEGMENT_HALF_THICKNESS
 } from "./constants";
 import {
   activePlayers,
   arcBarrierAngles,
+  centerChamberRadius,
+  centerSegments,
   clampPaddleToArc,
   paddleCatchPoint,
   paddleCenter,
@@ -112,6 +115,7 @@ export function createSimState(init?: {
     botDifficulty: "medium",
     gameVariant: "classic",
     triangleMotionMode: "steady",
+    centerShape: "triangle",
     triangleRotation: -Math.PI / 2,
     triangleAngularVelocity: TRIANGLE_ROTATION_SPEED,
     elapsed: 0,
@@ -223,6 +227,12 @@ export function updateArenaRotation(state: SimState, arena: ArenaGeometry, dt: n
 
 export function applyTriangleGravity(state: SimState, arena: ArenaGeometry, dt: number, minSpeed: number, maxSpeed: number): void {
   const towardTriangle = subVec(arena.center, state.ball);
+  // Hollow Trinity: don't pull the ball once it's INSIDE the chamber, or the well
+  // would trap it at dead-center forever. Outside the chamber the normal pull still
+  // draws the ball toward the trinity (so it gets sucked in and rattles).
+  if (state.centerShape === "trinity" && lengthVec(towardTriangle) < centerChamberRadius(arena) + BALL_RADIUS) {
+    return;
+  }
   const distanceSq = Math.max(lengthSqVec(towardTriangle), 1600);
   const force = Math.min(48, TRIANGLE_GRAVITY / distanceSq);
   const impulse = force * dt;
@@ -399,8 +409,14 @@ export function stepMenuPreview(state: SimState, arena: ArenaGeometry, dt: numbe
 
 function handleTriangleCollision(state: SimState, arena: ArenaGeometry, events: SimEvent[]): void {
   // During the intentional post-serve phase window the ball flies out from the
-  // arena center straight through the triangle — no collision at all.
+  // arena center straight through the centre piece — no collision at all. (For
+  // the hollow trinity this is exactly right: the ball serves out a corner gap.)
   if (state.elapsed < state.triangleCollisionDisabledUntil) {
+    return;
+  }
+
+  if (state.centerShape === "trinity") {
+    handleTrinityCollision(state, arena, events);
     return;
   }
 
@@ -458,6 +474,45 @@ function handleTriangleCollision(state: SimState, arena: ArenaGeometry, events: 
     reflectBall(state, normal);
     state.ball.x = closest.x + normal.x * (BALL_RADIUS + 0.5);
     state.ball.y = closest.y + normal.y * (BALL_RADIUS + 0.5);
+    clearTouchState(state);
+    state.lastTouchType = "triangle";
+    events.push({ kind: "triangleHit" });
+    return;
+  }
+}
+
+/**
+ * Hollow Trinity collision: 3 double-sided thin walls (capsules of half-thickness
+ * TRINITY_SEGMENT_HALF_THICKNESS). The ball bounces off whichever side it
+ * approaches and passes cleanly through the 3 corner gaps; it can rattle inside
+ * before escaping. The collision band (BALL_RADIUS + halfThickness ≈ 17px) is
+ * wider than the per-substep travel (≤ BALL_RADIUS*0.5 = 5px), so a wall can never
+ * be tunnelled. Reuses the same reactive-impulse + reflect-only-when-incoming guard
+ * as the solid triangle so the swivel and anti-jitter behaviour are identical.
+ */
+function handleTrinityCollision(state: SimState, arena: ArenaGeometry, events: SimEvent[]): void {
+  const band = BALL_RADIUS + TRINITY_SEGMENT_HALF_THICKNESS;
+  for (const segment of centerSegments(arena, state.triangleRotation)) {
+    const closest = closestPointOnSegment(state.ball, segment.start, segment.end);
+    const delta = subVec(state.ball, closest);
+    const distance = lengthVec(delta);
+    if (distance >= band) {
+      continue;
+    }
+
+    // Normal points from the wall toward the ball's side (double-sided). Degenerate
+    // dead-on hit (ball centred on the wall) falls back to the outward radial.
+    const normal = lengthSqVec(delta) > 0.0001
+      ? normalizeVecInPlace(delta)
+      : normalizeVecInPlace(subVec(state.ball, arena.center));
+    applyTriangleReactiveImpulse(state, arena, closest);
+    // Only reverse the ball if it's actually moving INTO the wall — prevents a
+    // just-reflected ball from being flipped again on the next substep.
+    if (dotVec(state.velocity, normal) < 0) {
+      reflectBall(state, normal);
+    }
+    state.ball.x = closest.x + normal.x * (band + 0.5);
+    state.ball.y = closest.y + normal.y * (band + 0.5);
     clearTouchState(state);
     state.lastTouchType = "triangle";
     events.push({ kind: "triangleHit" });
@@ -614,8 +669,11 @@ function paddleHitTest(state: SimState, arena: ArenaGeometry, player: SimPlayer,
     // Only the inner "cup" (concave face + wing flanks) plays the ball. Contacts
     // on the convex BACK — the arc that sits out on the goal ring — must never
     // reflect; bouncing off it is what read as "the ball bounces in front of /
-    // beside the paddle, not off it".
-    if (dotVec(subVec(contact, center), radial) > halfHeight * 0.5) {
+    // beside the paddle, not off it". The cutoff is BALL_RADIUS-aware so a ball
+    // grazing a wing flank within its own radius still registers (fixes "shoots
+    // through beside the paddle"), but clamped to 0.95*halfHeight so a true
+    // convex-back hit is still rejected even on the thinnest paddle.
+    if (dotVec(subVec(contact, center), radial) > Math.min(halfHeight * 0.5 + BALL_RADIUS, halfHeight * 0.95)) {
       continue;
     }
     const distance = distanceVec(contact, state.ball);
@@ -673,8 +731,8 @@ function paddleSweptHitTest(
     if (closest.distance > BALL_RADIUS) {
       continue;
     }
-    // Same back-arc exclusion as the static test (see paddleHitTest).
-    if (dotVec(subVec(closest.b, center), radial) > halfHeight * 0.5) {
+    // Same BALL_RADIUS-aware back-arc exclusion as the static test (see paddleHitTest).
+    if (dotVec(subVec(closest.b, center), radial) > Math.min(halfHeight * 0.5 + BALL_RADIUS, halfHeight * 0.95)) {
       continue;
     }
 

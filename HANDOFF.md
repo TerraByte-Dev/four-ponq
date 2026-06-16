@@ -11,6 +11,53 @@ NOT this repo's `Feedback.md` (which is a stale, separate channel).**
 `ssh terrabyte@192.168.1.207 'docker exec arcade-api cat /data/feedback.ndjson'`
 and filter `gameId=four-ponq`).
 
+**Session 2026-06-16 — the 3 still-open hub-feedback items (orbit/physics/center). Built + verified, ONE deploy:**
+1. **"Ball a lil too fast + doesn't connect to the paddle / shoots through / bounces in front"**
+   (Deaxohn + recurring) → TUNE + GEOMETRY (no netcode). `src/sim/constants.ts`:
+   `MAX_BALL_SPEED` 840→700, `MAX_CHARGED_BALL_SPEED` 980→820 (kept > rally cap),
+   `REPEAT_HIT_BOOST` 1.08→1.05. `src/sim/physics.ts`: the back-arc reject in BOTH
+   `paddleHitTest` and `paddleSweptHitTest` is now BALL_RADIUS-aware —
+   `Math.min(halfHeight*0.5 + BALL_RADIUS, halfHeight*0.95)` — so a ball grazing a
+   wing flank registers instead of sailing past, while the 0.95 clamp still rejects
+   true convex-back hits on the thinnest paddle. Kept the contact-point steer model.
+   (Known follow-up, deliberately deferred: the 12.5px radial *settle* at
+   physics.ts ~592 is the residual "bounces in front" pop; and the ~70ms ball-interp
+   vs predicted-paddle netcode offset.)
+2. **"Orbit doesn't actually rotate the map"** → one-liner: `targetViewRotation()`
+   (`src/main.ts`) returns 0 when `gameVariant === "rotating"`. The sim already
+   spins every arc+paddle (`updateArenaRotation`); the camera was pinning the local
+   arc to screen-top and CANCELLING that. Now the camera is fixed in orbit and the
+   whole arena visibly spins (verified: zones swept clockwise between two play
+   frames). Side effect (expected): non-top players see A/D screen-mirrored — noted
+   in the "Orbit on" message.
+3. **"New center shape: 3 spaced segments, hollow core, 3 gap openings, ball rattles
+   inside"** → new host **Center: Triangle | Hollow** rule, rotates on the same
+   `triangleRotation`/Steady-Reactive machinery. `CenterShape` type + `SimState.centerShape`
+   (default triangle) plumbed through `shared/protocol.ts` (`setSetting` key +
+   `{t:"room"}`), `server/room.ts`, `src/net/client.ts`, `src/main.ts` (mirror +
+   lobby UI + setter/handler/listener). Geometry `centerSegments`/`centerChamberRadius`
+   in `src/sim/geometry.ts`; collision `handleTrinityCollision` (double-sided capsule
+   walls, reuse the reactive impulse + `dot(v,n)<0` anti-jitter guard) + a chamber
+   gravity cutoff in `applyTriangleGravity` (else the well traps the ball); render
+   `drawTrinity` in `src/main.ts`.
+   ⚠️ TWO real traps found+fixed while verifying: (a) sized the corner gap by the
+   bare centerline (26px) but the walls are 7px capsules — the *clear* opening was
+   only 12px < ball; widened to `chamber=82, frac=0.44, halfThickness=5` so the gap
+   (39.8) clears `2*(BALL_RADIUS+halfThickness)=30`. (b) a hollow equilateral triangle
+   has a STABLE medial (edge-midpoint) billiard orbit; the walls sat exactly on the
+   midpoints so a dead-center launch could orbit forever. Fixed by an ASYMMETRIC
+   per-wall tilt (`TRINITY_WALL_TILTS = [0.18,-0.1,0.05]`) that breaks the 3-fold
+   symmetry. Probe: 0/64 dead-center + 0/240 outside-entry traps in both spin modes.
+
+Tests: `verify-paddle.cjs` (added Test 8 — gap-free wing coverage + speed cap),
+`verify-triangle.cjs` (unchanged, green), new **`verify-center.cjs`** (corner gap ≥
+ball+walls at every arena size; rattles ≥2; escapes from 24 dirs × both spin modes).
+All three ALL PASS. 2-client headless Playwright: host set Center=Hollow + Mode=Orbit,
+non-host MIRRORED both (buttons disabled = host-only enforced), canvas renders, orbit
+visibly rotates (`playtest-hollow-orbit-{lobby,2ndclient,play1,play2}.png`). TUNABLES
+to eyeball live: `MAX_BALL_SPEED`/`REPEAT_HIT_BOOST`, the trinity `TRINITY_*` consts
+(chamber/frac/thickness/tilts), the wing-cutoff clamp.
+
 **Session 2026-06-15 (round 2) shipped the two follow-up items — LIVE:**
 6. **"M menu sucks / kill the ugly big 'Four Ponq' card"** → DELETED the legacy
    `#menu-overlay`. The ONE menu is now the lobby-style **session panel** (two
