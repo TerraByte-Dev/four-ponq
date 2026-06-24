@@ -1,33 +1,57 @@
 import Phaser from "phaser";
 import "./styles.css";
+import { TAU, pointOnCircle, shortestAngleDelta, type Vec2 } from "./sim/math";
+import type {
+  ArenaGeometry,
+  BotDifficulty,
+  CenterShape,
+  GameMode,
+  GameVariant,
+  PlayerInput,
+  SimEvent,
+  SimPlayer,
+  SimState,
+  TriangleMotionMode
+} from "./sim/types";
+import {
+  BALL_RADIUS,
+  MAX_BALL_SPEED,
+  MAX_CHARGE,
+  MAX_SHIELDS,
+  TRIANGLE_ROTATION_SPEED,
+  TRINITY_SEGMENT_HALF_THICKNESS
+} from "./sim/constants";
+import { centerArcs, centerChamberRadius, computeArena, paddleCenter, paddleOutlinePoints, rebuildArcs, triangleVertices } from "./sim/geometry";
+import {
+  advanceBall,
+  applyTriangleGravity,
+  clearCatchState,
+  clearTouchState,
+  createSimState,
+  resetRound as simResetRound,
+  stepCaughtBall,
+  stepMenuPreview,
+  stepPaddles,
+  stepTriangleMotion,
+  updateArenaRotation,
+  updateCaughtBall
+} from "./sim/physics";
+import {
+  NetClient,
+  NET_ARENA_WIDTH,
+  NET_ARENA_HEIGHT,
+  COUNTDOWN_SECONDS,
+  type NetRenderState
+} from "./net/client";
 
-type GameMode = "menu" | "playing" | "paused" | "matchOver";
-type BotDifficulty = "easy" | "medium" | "hard";
-type TouchType = "none" | "player" | "triangle";
 type ThemeId = "neon" | "solar" | "deepSea" | "candy" | "mono";
-type TriangleMotionMode = "steady" | "reactive";
-type GameVariant = "classic" | "rotating";
 type VolumeTarget = "music" | "sfx";
 
-interface InputAction {
-  counterclockwise: boolean;
-  clockwise: boolean;
-}
-
-interface PlayerState {
-  id: number;
+/** Scene-side player: the pure sim fields (SimPlayer) plus render-only identity. */
+interface PlayerState extends SimPlayer {
   name: string;
   color: number;
   cssColor: string;
-  shields: number;
-  eliminated: boolean;
-  paddleAngle: number;
-  arcStart: number;
-  arcEnd: number;
-  humanControlled: boolean;
-  lastHumanInputAt: number;
-  charge: number;
-  paddleAssistMultiplier: number;
 }
 
 interface HudPlayerState {
@@ -49,14 +73,79 @@ interface HudState {
   triangleMotionMode: TriangleMotionMode;
   musicVolume: number;
   sfxVolume: number;
+  /** The local player's chosen display name (sent to the server as our name). */
+  playerName: string;
+  /** Index of THIS client's player among `players` (-1 if spectating). Marks "your" card. */
+  localSlot: number;
+  /**
+   * True while the ONLINE session screens (spectator banner / ready panel /
+   * countdown) own the overlay layer — the legacy offline menu card stays
+   * hidden so the two never stack. The local pause card (Esc) wins over it.
+   */
+  netSession: boolean;
 }
 
-interface ArenaGeometry {
-  center: Phaser.Math.Vector2;
-  radius: number;
-  paddleThickness: number;
-  paddleAngleSpan: number;
-  triangleRadius: number;
+/** One roster row on the online ready screen. */
+interface SessionRowState {
+  slot: number;
+  name: string;
+  isBot: boolean;
+  connected: boolean;
+  ready: boolean;
+  isSelf: boolean;
+  cssColor: string;
+}
+
+/**
+ * Everything the DOM session layer (spectator banner / ready panel / 3-2-1)
+ * renders. Emitted by the scene as "four-pong:session" on every HUD refresh;
+ * the DOM side memoizes so unchanged states cost nothing.
+ */
+interface SessionUiState {
+  /** Slim top banner: watching = "press Space to jump in", pending = "joining at next serve…". */
+  banner: "none" | "watching" | "pending";
+  /**
+   * The unified menu/lobby panel (Players | Rules + Settings + primary action) —
+   * the ONE menu, shown on the load-in lobby, on match-over, when paused (M), and
+   * offline. Hidden only during live play and while spectating (banner instead).
+   */
+  showPanel: boolean;
+  /** Heading: "Online lobby" / "Match over" / "Paused" / "Four Ponq". */
+  kicker: string;
+  /** Offline (server down) — local hot-seat semantics, no ready/host concept. */
+  offline: boolean;
+  /** Locally paused mid-match (M) — roster + rules are read-only, primary = Resume. */
+  paused: boolean;
+  /** The big primary button. */
+  primaryAction: "ready" | "resume" | "start" | "none";
+  primaryLabel: string;
+  /** Whether the rule chips are clickable (offline, or networked host on a ready screen). */
+  rulesEditable: boolean;
+  /** Sub-status line under the primary button. */
+  statusLine: string;
+  matchOver: boolean;
+  resultLine: string;
+  rows: SessionRowState[];
+  selfReady: boolean;
+  /** Connected humans not yet ready (self included while un-ready). */
+  waitingFor: number;
+  /** Seconds left in the 3-2-1, or null when no countdown is running. */
+  countdown: number | null;
+  /** Seated players get the "Space — cancel" hint under the countdown. */
+  seated: boolean;
+  /** True when WE are the host — host gets interactive rule controls; others read-only. */
+  isHost: boolean;
+  /** Authoritative shared gameplay settings, shown on the ready panel. */
+  difficulty: BotDifficulty;
+  gameVariant: GameVariant;
+  triangleMotion: TriangleMotionMode;
+  centerShape: CenterShape;
+  botFill: boolean;
+  /** Per-client cosmetics, shown in the nested Settings sub-view. */
+  themeId: ThemeId;
+  musicVolume: number;
+  sfxVolume: number;
+  playerName: string;
 }
 
 interface PaddleImpactBurst {
@@ -84,21 +173,6 @@ interface ConfettiParticle {
   lifetime: number;
 }
 
-interface PaddleCollisionHit {
-  contact: Phaser.Math.Vector2;
-  normal: Phaser.Math.Vector2;
-  radial: Phaser.Math.Vector2;
-  offset: number;
-  penetration: number;
-  crossed: boolean;
-}
-
-interface PaddleSegment {
-  start: Phaser.Math.Vector2;
-  end: Phaser.Math.Vector2;
-  offset: number;
-}
-
 interface ThemeDefinition {
   id: ThemeId;
   name: string;
@@ -115,51 +189,28 @@ interface ThemeDefinition {
   playerColors: Array<{ color: number; cssColor: string }>;
 }
 
-const MAX_SHIELDS = 5;
-const BALL_RADIUS = 10;
-const TAU = Math.PI * 2;
-const TRIANGLE_GRAVITY = 21000;
-const TRIANGLE_ROTATION_SPEED = 0.34;
-const TRIANGLE_REACTIVE_DAMPING = 0.997;
-const TRIANGLE_REACTIVE_MIN_SPEED = 0.12;
-const TRIANGLE_REACTIVE_MAX_SPEED = 3.05;
-const TRIANGLE_PHASE_DELAY = 1000;
-const PADDLE_CURVE_RESPONSE = 0.72;
-const PADDLE_RELEASE_GAP = 2.5;
-const PADDLE_CONCAVITY = 0.48;
-const PADDLE_WING_LENGTH_MIN = 16;
-const PADDLE_WING_LENGTH_RATIO = 0.045;
-const MAX_CHARGE = 10;
-const REPEAT_HIT_BOOST = 1.08;
-const CATCH_DURATION = 3000;
-const CATCH_LAUNCH_BOOST = 2;
-const SPAWN_DELAY = 850;
-const BASE_BALL_SPEED = 380;
-const MENU_BALL_SPEED = 180;
-const BASE_PADDLE_SPEED = 2.3625;
-const PADDLE_SPEED_RAMP = 0.045;
-const MAX_PADDLE_SPEED_MULTIPLIER = 1.36;
-const PADDLE_MOVE_ASSIST = 0.1;
-const PADDLE_ASSIST_ACCELERATION = 6.5;
-const PADDLE_ASSIST_DECELERATION = 9.5;
-const ROTATING_VARIANT_PADDLE_SPEED_BOOST = 1.05;
-const ARENA_ROTATION_SPEED = 0.18;
-const MAX_BALL_SPEED = 840;
-const MAX_CHARGED_BALL_SPEED = 980;
+// Gameplay/tuning constants live in src/sim/constants.ts now — only
+// render/audio-facing constants remain here.
 const SERVE_INDICATOR_LIFETIME = 1700;
 const SERVE_INDICATOR_LENGTH = 62;
 const BALL_TRAIL_LIFETIME = 360;
 const BALL_TRAIL_SAMPLE_DISTANCE = 10;
-const ARC_BARRIER_HALF_ANGLE = 0.04125;
-const ARC_BARRIER_INSET = 6;
-const ARC_BARRIER_THICKNESS = 15;
 const CONFETTI_LIFETIME = 1500;
 const PADDLE_HIT_INDICATOR_LIFETIME = 170;
 const PADDLE_HIT_INDICATOR_LENGTH = 34;
 const PADDLE_HIT_INDICATOR_GAP = 4;
 const PADDLE_HIT_INDICATOR_FAN_ANGLE = 0.48;
 const PADDLE_HIT_SOUND_COOLDOWN = 500;
+/**
+ * Master volume ceiling: the music/SFX sliders' 100% maps to this fraction of
+ * full output, so the loudest setting is far gentler (the old 20% IS the new
+ * 100%). Applied to every actual play() gain; the sliders stay 0–100%.
+ */
+const VOLUME_CEILING = 0.2;
 const PADDLE_HIT_SOUND_VOLUME = 0.56;
+/** How long the "that's YOUR paddle" pulse runs after the server seats us (ms). */
+const SEAT_FLASH_DURATION = 2600;
+const COUNTDOWN_TICK_VOLUME = 0.5;
 const PADDLE_HIT_SOUND_KEYS = [
   "paddle-clonk-01",
   "paddle-clonk-02",
@@ -174,6 +225,20 @@ const WIN_FANFARE_KEYS = [
   "win-fanfare-02",
   "win-fanfare-03"
 ] as const;
+// A player can grab/launch ("super") on their next face hit once their visible
+// charge reaches this. addCharge() bumps +1 before the catch check, so the
+// effective "ready" charge entering a hit is MAX_CHARGE - 1; the HUD meter and
+// the in-arena glow both treat this value as "full / ready".
+const CHARGE_READY_AT = Math.max(1, MAX_CHARGE - 1);
+
+/** Transparent placeholder texture so the avatar image pool can exist pre-load. */
+const AVATAR_BLANK_TEX = "fp-avatar-blank";
+
+/** Phaser texture key for a player's decoded doodle avatar (keyed by public id). */
+function avatarTexKey(publicId: string): string {
+  return "fp-avatar:" + publicId;
+}
+
 const MUSIC_TRACKS = [
   {
     key: "music-round-01",
@@ -192,12 +257,6 @@ const MUSIC_TRACKS = [
     file: "04-round-four-home-stretch-chill-drums-half-bell.wav"
   }
 ] as const;
-
-const BOT_DIFFICULTY_SPEED: Record<BotDifficulty, number> = {
-  easy: 0.42,
-  medium: 0.68,
-  hard: 0.94
-};
 
 const THEMES: Record<ThemeId, ThemeDefinition> = {
   neon: {
@@ -308,28 +367,20 @@ class FourPongScene extends Phaser.Scene {
   private players: PlayerState[] = [];
   private ball = new Phaser.Math.Vector2(0, 0);
   private velocity = new Phaser.Math.Vector2(0, 0);
-  private mode: GameMode = "menu";
+  // All gameplay state lives in the pure SimState (src/sim/physics.ts steps
+  // it). ball/velocity/players above are shared into it BY REFERENCE — Phaser
+  // Vector2 satisfies Vec2 structurally — so render code and the sim always
+  // see the same objects. Built in create() once the players exist.
+  private sim!: SimState;
+  private rng: () => number = Math.random;
   private message = "Circular 4 Player is ready.";
-  private botFill = true;
-  private botDifficulty: BotDifficulty = "medium";
-  private gameVariant: GameVariant = "classic";
   private themeId: ThemeId = "neon";
-  private triangleMotionMode: TriangleMotionMode = "steady";
-  private musicVolume = 0.58;
-  private sfxVolume = 0.82;
-  private triangleRotation = -Math.PI / 2;
-  private triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
-  private elapsed = 0;
-  private lastScoreAt = 0;
-  private triangleCollisionDisabledUntil = 0;
-  private roundNumber = 0;
-  private roundResolving = false;
-  private lastTouchType: TouchType = "none";
-  private lastTouchPlayerId?: number;
-  private caughtByPlayerId?: number;
-  private caughtAt = 0;
-  private caughtLaunchSpeed = 0;
-  private roundReadyAt = 0;
+  private musicVolume = 0.02;
+  private sfxVolume = 0.05;
+  /** Persisted, player-editable display name (defaults to a random one). */
+  private playerName = loadOrCreatePlayerName();
+  /** Eased camera spin that keeps the local player's side at screen-top. */
+  private currentViewRotation = 0;
   private paddleImpactBursts: PaddleImpactBurst[] = [];
   private ballTrail: BallTrailPoint[] = [];
   private confettiParticles: ConfettiParticle[] = [];
@@ -338,9 +389,104 @@ class FourPongScene extends Phaser.Scene {
   private lastPaddleHitSoundAt = -Infinity;
   private activeMusic?: Phaser.Sound.BaseSound;
   private activeMusicKey?: string;
+  private homeOverlayOpen = false;
+  private pausedByHomeOverlay = false;
+  private prevSoundMute = false;
+
+  // --- networked multiplayer (Stage 1) ------------------------------------
+  // When `net` is connected with snapshots, update() renders SERVER state
+  // instead of running the local authoritative sim. When it's null/offline,
+  // everything below behaves exactly like the original hot-seat game.
+  private net?: NetClient;
+  /** True once the net client is open — seated player OR spectator. */
+  private networked = false;
+  /** Server-driven status line for the lobby/HUD while networked. */
+  private netStatus = "Connecting to the arcade server…";
+  /** Sim-elapsed deadline for the "this is your paddle" highlight pulse. */
+  private seatFlashUntil = -Infinity;
+  /** Winner line captured at the matchOver event, shown on the ready screen. */
+  private lastResultLine = "";
+  /**
+   * Interpolated authoritative triangle pose from the server snapshot. While
+   * networked we render THIS (not the local sim spin) so the visible triangle
+   * matches the surface the ball actually bounces off. null = offline / no snap
+   * yet → fall back to the local sim's triangleRotation.
+   */
+  private netTriangleRotation: number | null = null;
+  /** Our own hub profile public id (for the avatar relay); "" until learned. */
+  private localPublicId = "";
+  /** Per-publicId doodle load state — avoids refetch; texture = avatarTexKey(). */
+  private readonly avatarState = new Map<string, "loading" | "ready" | "failed">();
+  /** Per-slot doodle-avatar images, counter-rotated, drawn behind each section. */
+  private avatarSprites: Phaser.GameObjects.Image[] = [];
+  /** Per-slot initial-letter fallback labels (shown when a slot has no avatar). */
+  private clusterInitials: Phaser.GameObjects.Text[] = [];
 
   constructor() {
     super("four-pong");
+  }
+
+  // Thin accessors over sim-owned state so scene/render/UI code keeps reading
+  // a single source of truth without sprinkling `this.sim.` everywhere.
+  private get mode(): GameMode {
+    return this.sim.mode;
+  }
+
+  private set mode(value: GameMode) {
+    this.sim.mode = value;
+  }
+
+  private get elapsed(): number {
+    return this.sim.elapsed;
+  }
+
+  private get botFill(): boolean {
+    return this.sim.botFill;
+  }
+
+  private set botFill(value: boolean) {
+    this.sim.botFill = value;
+  }
+
+  private get botDifficulty(): BotDifficulty {
+    return this.sim.botDifficulty;
+  }
+
+  private set botDifficulty(value: BotDifficulty) {
+    this.sim.botDifficulty = value;
+  }
+
+  private get gameVariant(): GameVariant {
+    return this.sim.gameVariant;
+  }
+
+  private set gameVariant(value: GameVariant) {
+    this.sim.gameVariant = value;
+  }
+
+  private get triangleMotionMode(): TriangleMotionMode {
+    return this.sim.triangleMotionMode;
+  }
+
+  private set triangleMotionMode(value: TriangleMotionMode) {
+    this.sim.triangleMotionMode = value;
+  }
+
+  private get centerShape(): CenterShape {
+    return this.sim.centerShape;
+  }
+
+  private set centerShape(value: CenterShape) {
+    this.sim.centerShape = value;
+  }
+
+  /**
+   * Render-facing index of the LOCAL player among this.players: slot 0 offline
+   * (the lone human), the net seat online, -1 for spectators. Used to mark
+   * "your" HUD card and draw the charge-ready glow on your own paddle.
+   */
+  private localSlot(): number {
+    return this.networked ? (this.net?.slot ?? -1) : 0;
   }
 
   preload() {
@@ -379,32 +525,267 @@ class FourPongScene extends Phaser.Scene {
     window.addEventListener("four-pong:toggle-bots", this.handleBotEvent);
     window.addEventListener("four-pong:set-difficulty", this.handleDifficultyEvent);
     window.addEventListener("four-pong:set-game-variant", this.handleGameVariantEvent);
+    window.addEventListener("four-pong:set-center-shape", this.handleCenterShapeEvent);
     window.addEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.addEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.addEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.addEventListener("four-pong:set-name", this.handleSetNameEvent);
+    window.addEventListener("four-pong:join", this.handleJoinEvent);
+    window.addEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.addEventListener("keydown", this.handleWindowKeyDown);
+    window.addEventListener("arcade:home-open", this.handleHomeOpen);
+    window.addEventListener("arcade:home-close", this.handleHomeClose);
 
     this.keys = this.input.keyboard!.addKeys({
       counterclockwise: Phaser.Input.Keyboard.KeyCodes.A,
       clockwise: Phaser.Input.Keyboard.KeyCodes.D,
       reset: Phaser.Input.Keyboard.KeyCodes.R,
       pause: Phaser.Input.Keyboard.KeyCodes.SPACE,
-      escape: Phaser.Input.Keyboard.KeyCodes.ESC,
       bot: Phaser.Input.Keyboard.KeyCodes.B
     }) as Record<string, Phaser.Input.Keyboard.Key>;
 
     this.players = [
-      this.createPlayer(1, "P1", 0x62e6ff, "#62e6ff"),
+      // Slot 0 is the local player offline; show their chosen name. Networked
+      // play overwrites all four names from the server roster via handleNetChange.
+      this.createPlayer(1, this.playerName, 0x62e6ff, "#62e6ff"),
       this.createPlayer(2, "P2", 0xff6f91, "#ff6f91"),
       this.createPlayer(3, "P3", 0xf8d66d, "#f8d66d"),
       this.createPlayer(4, "P4", 0x69db7c, "#69db7c")
     ];
+    this.sim = createSimState({ players: this.players, ball: this.ball, velocity: this.velocity });
     this.applyPlayerTheme();
+    this.createClusterHud();
 
     this.scale.on("resize", this.handleResize, this);
-    this.rebuildArcs();
+    rebuildArcs(this.arena(), this.players);
     this.resetRound(undefined, false);
     this.emitHud();
+
+    this.connectNet();
+    void this.adoptArcadeProfileName();
+  }
+
+  /**
+   * Pull the player's hub profile name from the arcade backend (same-origin
+   * /api/profile, routed to arcade-api by Caddy on every game subdomain) and
+   * adopt it as our display name. The hub stores the chosen name keyed by the
+   * verified Access email; this is how a per-browser game shows the SAME name
+   * the player set in the arcade hub. Best-effort: a 404 (local dev), a network
+   * error, or an empty name all leave the local random/persisted name in place.
+   */
+  private async adoptArcadeProfileName() {
+    try {
+      const res = await fetch("/api/profile", { cache: "no-store" });
+      if (!res.ok) {
+        return;
+      }
+      const data = (await res.json()) as { displayName?: unknown; publicId?: unknown; avatar?: unknown };
+      const name = typeof data.displayName === "string" ? sanitizePlayerName(data.displayName) : "";
+      if (name && name !== this.playerName) {
+        this.setPlayerName(name);
+      }
+      // Report our hub profile id so peers can fetch + show our doodle avatar,
+      // and seed our OWN avatar straight from this response (no second fetch).
+      const publicId = typeof data.publicId === "string" ? data.publicId : "";
+      if (publicId) {
+        this.localPublicId = publicId;
+        this.net?.setProfile(publicId);
+        const avatar = typeof data.avatar === "string" ? data.avatar : "";
+        if (avatar) {
+          this.loadAvatarTexture(publicId, avatar);
+        }
+      }
+    } catch {
+      // No arcade backend reachable — keep the local name + initial-letter HUD.
+    }
+  }
+
+  /**
+   * Try to join the shared server room. Best-effort: if the socket never opens
+   * (offline dev, server down), `networked` stays false and update() keeps
+   * running the local hot-seat sim — the game is fully playable offline.
+   */
+  private connectNet() {
+    this.net = new NetClient({
+      name: this.playerName,
+      onEvent: (kind, data) => this.handleNetEvent(kind, data),
+      onChange: () => this.handleNetChange(),
+      onSeated: (slot) => this.handleSeated(slot)
+    });
+    this.net.connect();
+  }
+
+  /**
+   * {t:"seated"} landed — we just got a paddle (immediate join from the ready
+   * screen, or the deferred next-serve seat replacing a bot). Pulse a highlight
+   * around OUR paddle so a fresh joiner instantly knows which arc is theirs.
+   */
+  private handleSeated(slot: number) {
+    this.seatFlashUntil = this.elapsed + SEAT_FLASH_DURATION;
+    this.message = `You're in — P${slot + 1} is your paddle.`;
+    this.emitHud();
+  }
+
+  /**
+   * Connection/roster/mode changed. Flips us into (or out of) networked render
+   * mode, mirrors the server's match mode onto the local `mode` so the existing
+   * menu-overlay show/hide logic keeps working, and refreshes the lobby status.
+   */
+  private handleNetChange() {
+    const net = this.net;
+    if (!net) return;
+
+    // Stage 2: ANY open connection is networked — spectators (slot -1) watch
+    // the live server match too; they just render pure interpolation (no
+    // prediction) and get the "jump in" banner instead of inputs.
+    const open = net.state === "open";
+
+    if (open && !this.networked) {
+      // Entering networked mode: stop the local sim's authority. The local
+      // `mode` now just mirrors the server's so the overlay/HUD behave.
+      this.networked = true;
+    } else if (!open && this.networked) {
+      // Lost the server (closed/errored): fall back to the offline sim. Re-serve
+      // so the frozen ball starts moving locally again.
+      this.networked = false;
+      this.mode = "playing";
+      this.resumeRoundIfStalled();
+    }
+
+    if (this.networked) {
+      // Mirror the server roster names onto the render players so the HUD and
+      // ready-screen roster agree on who is who.
+      for (const pv of net.players) {
+        const local = this.players[pv.slot];
+        if (local && pv.name) {
+          local.name = pv.name;
+        }
+        // Lazily fetch each seat's doodle avatar (cached by public id).
+        if (pv.publicId) {
+          this.ensureAvatar(pv.publicId);
+        }
+      }
+      // Mirror server match mode onto the local enum the renderer/overlay read.
+      // lobby → "menu", countdown/playing → "playing" (arena live; the 3-2-1 is
+      // session DOM), matchOver → "matchOver". Local pause stays local.
+      if (this.mode !== "paused") {
+        this.mode =
+          net.mode === "playing" || net.mode === "countdown"
+            ? "playing"
+            : net.mode === "matchOver"
+              ? "matchOver"
+              : "menu";
+      }
+      if (net.mode === "playing") {
+        this.lastResultLine = ""; // stale winner line must not leak into the next matchOver
+      }
+      this.netStatus = this.describeRoom(net);
+      this.message = this.netStatus;
+      // Mirror the server's authoritative shared settings onto the local sim so
+      // the renderer/HUD (triangle spin, arena rotation, CPU label) match what
+      // the server is actually running. The host sets these; everyone reflects.
+      this.botFill = net.botFill;
+      this.botDifficulty = net.difficulty;
+      this.gameVariant = net.gameVariant;
+      this.triangleMotionMode = net.triangleMotion;
+      this.centerShape = net.centerShape;
+    }
+
+    this.pushArcadeRoster();
+    this.emitHud();
+  }
+
+  /**
+   * Mirror the live room roster into the arcade HOME overlay's P1-P4 strip
+   * (names, bot tags, "(you)", and "Open" placeholders for empty seats). When
+   * we're not on the server (offline local hot-seat) we clear it back to
+   * placeholders. The overlay is injected by the hub and absent in local dev,
+   * so guard every call.
+   */
+  private pushArcadeRoster() {
+    const overlay = window.__arcadeHome ?? window.__arcadeHomeOverlay;
+    if (!overlay || typeof overlay.setPlayers !== "function") return;
+    const net = this.net;
+    if (!net || net.state !== "open") {
+      overlay.clearPlayers?.();
+      return;
+    }
+    overlay.setPlayers(
+      net.players.map((p) => ({
+        slot: p.slot,
+        name: p.name,
+        connected: p.connected,
+        isBot: p.isBot,
+        you: p.slot === net.slot
+      }))
+    );
+  }
+
+  /** Human-readable lobby line: "Connected as P2 · 3 players · waiting". */
+  private describeRoom(net: NetClient): string {
+    if (net.state !== "open") {
+      return "Connecting to the arcade server…";
+    }
+    if (net.slot < 0) {
+      return net.joinPending
+        ? "Joining at the next serve…"
+        : "Watching live — press Space to jump in.";
+    }
+    const humans = net.players.filter((p) => !p.isBot && p.connected).length;
+    const roster = net.players
+      .map((p) => `P${p.slot + 1}${p.isBot ? " (bot)" : ""}`)
+      .join(", ");
+    const phase =
+      net.mode === "playing"
+        ? "in play"
+        : net.mode === "countdown"
+          ? "starting"
+          : net.mode === "matchOver"
+            ? "match over"
+            : "in lobby";
+    return `Connected as P${net.slot + 1} · ${humans} human${humans === 1 ? "" : "s"} · ${roster} · ${phase}`;
+  }
+
+  /**
+   * Server gameplay events → client sound/fx. Authoritative sound: every client
+   * plays the hit/goal/win on receipt so audio matches the server state.
+   */
+  private handleNetEvent(kind: string, _data?: unknown) {
+    switch (kind) {
+      case "ballHit":
+        this.playPaddleHitSound();
+        this.trimBallTrail();
+        break;
+      case "goal":
+      case "eliminated":
+        // Snap the trail so the re-serve reads cleanly; the snapshot drives the
+        // actual ball reset.
+        this.trimBallTrail();
+        break;
+      case "matchOver": {
+        this.playWinFanfare();
+        const winner = this.players.find((p) => !p.eliminated);
+        // Capture the winner line NOW (from the final snapshot) — by the time
+        // the matchOver ready screen renders, shields/eliminated may reset.
+        this.lastResultLine = winner ? `${winner.name} takes the match!` : "Match over.";
+        // Achievement: the LOCAL player won this networked match (not a spectator, not a bot/other seat).
+        const mySlotNet = this.net?.slot ?? -1;
+        if (mySlotNet >= 0 && winner && this.players[mySlotNet] === winner) {
+          window.__arcadeHome?.unlockAchievement?.("four-ponq-win");
+        }
+        this.spawnWinConfetti(winner);
+        this.emitHud();
+        break;
+      }
+      case "countdownTick":
+        this.playCountdownTick();
+        break;
+      case "serve":
+        this.paddleImpactBursts = [];
+        this.ballTrail = [];
+        break;
+      // "error" and any unknown kinds are intentionally ignored for sound.
+    }
   }
 
   shutdown() {
@@ -413,17 +794,39 @@ class FourPongScene extends Phaser.Scene {
     window.removeEventListener("four-pong:toggle-bots", this.handleBotEvent);
     window.removeEventListener("four-pong:set-difficulty", this.handleDifficultyEvent);
     window.removeEventListener("four-pong:set-game-variant", this.handleGameVariantEvent);
+    window.removeEventListener("four-pong:set-center-shape", this.handleCenterShapeEvent);
     window.removeEventListener("four-pong:set-theme", this.handleThemeEvent);
     window.removeEventListener("four-pong:set-triangle-motion", this.handleTriangleMotionEvent);
     window.removeEventListener("four-pong:set-volume", this.handleVolumeEvent);
+    window.removeEventListener("four-pong:set-name", this.handleSetNameEvent);
+    window.removeEventListener("four-pong:join", this.handleJoinEvent);
+    window.removeEventListener("four-pong:ready-toggle", this.handleReadyToggleEvent);
     window.removeEventListener("keydown", this.handleWindowKeyDown);
+    window.removeEventListener("arcade:home-open", this.handleHomeOpen);
+    window.removeEventListener("arcade:home-close", this.handleHomeClose);
+    this.net?.close();
+    this.net = undefined;
+    this.networked = false;
+    this.netTriangleRotation = null;
+    this.avatarSprites.forEach((s) => s.destroy());
+    this.avatarSprites = [];
+    this.clusterInitials.forEach((t) => t.destroy());
+    this.clusterInitials = [];
     this.stopMusic();
   }
 
   update(_time: number, delta: number) {
     const dt = Math.min(delta / 1000, 0.034);
-    this.elapsed += delta;
+    this.sim.elapsed += delta;
 
+    // NETWORKED PATH: when the server is driving, we do NOT run the local
+    // authoritative sim. We read interpolated server state and render it.
+    if (this.networked) {
+      this.updateNetworked(dt);
+      return;
+    }
+
+    // OFFLINE PATH: unchanged original hot-seat sim.
     if (Phaser.Input.Keyboard.JustDown(this.keys.reset)) {
       this.restartMatch();
     }
@@ -432,30 +835,138 @@ class FourPongScene extends Phaser.Scene {
       this.toggleBotFill();
     }
 
-    this.updateTriangleMotion(dt);
+    stepTriangleMotion(this.sim, dt);
     this.updateBallTrail();
     this.updateConfetti(dt);
     this.updateMusic();
 
     if (this.mode === "playing") {
-      this.updateArenaRotation(dt);
-      this.updatePaddles(dt);
-      if (this.caughtByPlayerId !== undefined) {
-        this.updateCaughtBall();
-        if (!this.keys.pause.isDown || this.elapsed - this.caughtAt >= CATCH_DURATION) {
-          this.launchCaughtBall();
-        }
-      } else if (this.elapsed < this.roundReadyAt) {
+      const arena = this.arena();
+      const input = this.readLocalInput();
+      updateArenaRotation(this.sim, arena, dt);
+      stepPaddles(this.sim, arena, input, dt);
+      if (this.sim.caughtByPlayerId !== undefined) {
+        this.applySimEvents(stepCaughtBall(this.sim, arena, input.catchHeld));
+      } else if (this.sim.elapsed < this.sim.roundReadyAt) {
         // Give players a readable beat before the serve starts moving.
       } else {
-        this.applyTriangleGravity(dt, 275, MAX_BALL_SPEED);
-        this.advanceBall(dt);
+        applyTriangleGravity(this.sim, arena, dt, 275, MAX_BALL_SPEED);
+        this.applySimEvents(advanceBall(this.sim, arena, dt, input.catchHeld, this.rng));
       }
     } else if (this.mode === "menu") {
-      this.previewMenuMotion(dt);
+      this.applySimEvents(stepMenuPreview(this.sim, this.arena(), dt));
     }
 
     this.renderArena();
+  }
+
+  /**
+   * The networked render tick. Reads the interpolated server snapshot, writes
+   * it onto the render-facing state (this.ball + this.players' sim fields), and
+   * draws — but never advances any authoritative physics. Local input is
+   * predicted for our own paddle (inside NetClient) and the change is pushed to
+   * the server here.
+   */
+  private updateNetworked(dt: number) {
+    const net = this.net;
+    if (!net) {
+      this.networked = false;
+      return;
+    }
+
+    // 1. Local input → server (change-only) + drive own-paddle prediction.
+    //    Seated players only — spectators (slot -1) send nothing and render
+    //    pure interpolation. While the arcade HOME overlay / pause card is up,
+    //    or on the ready screen, we send "no input" so a paused/lobbied owner
+    //    doesn't keep nudging their paddle on the server. Charge stays scoped
+    //    to live play so the ready/countdown Space never fires a catch.
+    if (net.slot >= 0) {
+      const pausedLocally = this.mode === "paused";
+      const live = net.mode === "playing" || net.mode === "countdown";
+      const allow = live && !pausedLocally;
+      const ccw = allow && this.keys.counterclockwise.isDown;
+      const cw = allow && this.keys.clockwise.isDown;
+      const charge = allow && net.mode === "playing" && this.keys.pause.isDown;
+      net.sendInput(ccw, cw, charge);
+      net.predict(dt);
+    }
+
+    // 2. Pull the interpolated state and project it onto render-facing fields.
+    const render = net.read((x, y) => this.mapServerBall(x, y));
+    if (render) {
+      this.applyNetRenderState(render);
+    }
+
+    // 3. Triangle spin + cosmetic effects are purely visual; keep them lively.
+    stepTriangleMotion(this.sim, dt);
+    this.updateBallTrail();
+    this.updateConfetti(dt);
+    this.updateMusic();
+
+    this.renderArena();
+  }
+
+  /**
+   * Map a server-sim-space ball coordinate (simulated in a fixed canonical
+   * arena, NET_ARENA_WIDTH×NET_ARENA_HEIGHT) into THIS client's render arena.
+   * Paddle angles need no such remap — they're frame-independent — so only the
+   * ball flows through here. Mirrors how handleResize remaps the ball.
+   */
+  private mapServerBall(x: number, y: number): Vec2 {
+    const server = computeArena(NET_ARENA_WIDTH, NET_ARENA_HEIGHT);
+    const local = this.arena();
+    const scale = local.radius / server.radius;
+    return {
+      x: local.center.x + (x - server.center.x) * scale,
+      y: local.center.y + (y - server.center.y) * scale
+    };
+  }
+
+  /**
+   * Write an interpolated server snapshot onto the render-facing state. Slots
+   * map 1:1 to this.players[0..3]. Sets this.ball (drawn directly), each
+   * player's paddleAngle / charge / shields / eliminated (read by the HUD and
+   * paddle/arc drawing), and rebuilds arcs when the elimination set changed so
+   * surviving paddles re-spread like the local sim does.
+   */
+  private applyNetRenderState(render: NetRenderState) {
+    this.ball.set(render.ball.x, render.ball.y);
+    // Adopt the server's authoritative triangle pose for rendering (see field doc).
+    this.netTriangleRotation = render.triangleRotation;
+
+    let eliminationChanged = false;
+    this.players.forEach((player, slot) => {
+      if (slot < render.paddles.length) {
+        player.paddleAngle = render.paddles[slot];
+      }
+      if (slot < render.charges.length) {
+        player.charge = render.charges[slot];
+      }
+      if (slot < render.shields.length) {
+        player.shields = render.shields[slot];
+      }
+      if (slot < render.eliminated.length) {
+        const next = render.eliminated[slot];
+        if (next !== player.eliminated) {
+          eliminationChanged = true;
+        }
+        player.eliminated = next;
+      }
+    });
+
+    if (eliminationChanged) {
+      // Re-split the circle so the survivors' arcs match the server roster.
+      // rebuildArcs recenters paddleAngle to each arc's middle, so re-apply the
+      // authoritative snapshot angles afterward to avoid a one-frame jump.
+      rebuildArcs(this.arena(), this.players);
+      this.players.forEach((player, slot) => {
+        if (slot < render.paddles.length) {
+          player.paddleAngle = render.paddles[slot];
+        }
+      });
+    }
+
+    this.emitHud();
   }
 
   private createPlayer(id: number, name: string, color: number, cssColor: string): PlayerState {
@@ -477,9 +988,24 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private startGame() {
+    // Networked: "Start" marks US ready — the SERVER starts the match once all
+    // connected humans are ready (3-2-1 countdown). The local pause card
+    // (HOME overlay / Esc) is handled purely locally below.
+    if (this.networked && this.net) {
+      if (this.mode === "paused") {
+        this.mode = "playing";
+        this.message = "Back in motion.";
+        this.emitHud();
+        return;
+      }
+      this.net.sendReady(true);
+      return;
+    }
+
     if (this.mode === "paused") {
       this.mode = "playing";
       this.message = "Back in motion.";
+      this.resumeRoundIfStalled();
       this.emitHud();
       return;
     }
@@ -496,498 +1022,170 @@ class FourPongScene extends Phaser.Scene {
       player.paddleAssistMultiplier = 1;
     }
 
-    this.roundNumber = 0;
-    this.clearTouchState();
-    this.clearCatchState();
-    this.roundResolving = false;
+    this.sim.roundNumber = 0;
+    clearTouchState(this.sim);
+    clearCatchState(this.sim);
+    this.sim.roundResolving = false;
     this.confettiParticles = [];
     this.mode = "playing";
     this.message = message;
-    this.rebuildArcs();
+    rebuildArcs(this.arena(), this.players);
     this.resetRound();
     this.emitHud();
   }
 
-  private updatePaddles(dt: number) {
-    const action = this.readLocalAction();
-    const human = this.players.find((player) => player.humanControlled && !player.eliminated);
-    const speed = BASE_PADDLE_SPEED * this.paddleSpeedMultiplier() * this.variantPaddleSpeedMultiplier();
-    const humanMoving = action.counterclockwise || action.clockwise;
-
-    if (human) {
-      this.updatePaddleAssist(human, dt, humanMoving);
-    }
-
-    if (human && humanMoving) {
-      const direction = (action.clockwise ? 1 : 0) - (action.counterclockwise ? 1 : 0);
-      human.paddleAngle += direction * speed * human.paddleAssistMultiplier * dt;
-      human.lastHumanInputAt = this.elapsed;
-      this.clampPaddleToArc(human);
-    }
-
-    if (!this.botFill) {
-      return;
-    }
-
-    const targetAngle = normalizeAngle(Math.atan2(this.ball.y - this.arena().center.y, this.ball.x - this.arena().center.x));
-    const botSpeed = speed * BOT_DIFFICULTY_SPEED[this.botDifficulty];
-    for (const player of this.players) {
-      if (player.eliminated || player.humanControlled) {
-        continue;
-      }
-
-      const target = clampAngleToArc(targetAngle, player.arcStart, player.arcEnd, this.paddleSafetyMargin(player));
-      const delta = shortestAngleDelta(player.paddleAngle, target);
-      player.paddleAngle = normalizeAngle(player.paddleAngle + Phaser.Math.Clamp(delta, -botSpeed * dt, botSpeed * dt));
-      this.clampPaddleToArc(player);
-    }
-  }
-
-  private updatePaddleAssist(player: PlayerState, dt: number, moving: boolean) {
-    const arena = this.arena();
-    const distanceToPaddle = this.ball.distance(this.paddleCenter(arena, player));
-    const closeDistance = arena.radius * 0.42;
-    const farDistance = arena.radius;
-    const farFactor = Phaser.Math.Clamp((distanceToPaddle - closeDistance) / Math.max(farDistance - closeDistance, 1), 0, 1);
-    const target = moving ? 1 + PADDLE_MOVE_ASSIST * farFactor : 1;
-    const rate = target > player.paddleAssistMultiplier ? PADDLE_ASSIST_ACCELERATION : PADDLE_ASSIST_DECELERATION;
-    const smoothing = 1 - Math.exp(-rate * dt);
-    player.paddleAssistMultiplier = Phaser.Math.Linear(player.paddleAssistMultiplier, target, smoothing);
-  }
-
-  private readLocalAction(): InputAction {
+  private readLocalInput(): PlayerInput {
     return {
       counterclockwise: this.keys.counterclockwise.isDown,
-      clockwise: this.keys.clockwise.isDown
+      clockwise: this.keys.clockwise.isDown,
+      catchHeld: this.keys.pause.isDown
     };
   }
 
-  private handlePaddleCollisions(previousBall?: Phaser.Math.Vector2) {
-    const arena = this.arena();
-    for (const player of this.activePlayers()) {
-      const hit = this.paddleHitTest(arena, player, previousBall);
-      if (!hit) {
-        continue;
-      }
+  /**
+   * Maps SimEvents from the pure simulation (src/sim/physics.ts) onto scene
+   * side effects: particles, sound, status messages, HUD refreshes, and the
+   * delayed re-serve. Keeps rendering/audio out of the sim so it can run
+   * headless on a server later.
+   */
+  private applySimEvents(events: SimEvent[]) {
+    let hudDirty = false;
 
-      if (this.velocity.dot(hit.normal) >= 0 && !hit.crossed && hit.penetration <= 0) {
-        continue;
-      }
-
-      const tangent = new Phaser.Math.Vector2(-hit.radial.y, hit.radial.x);
-      const roundedNormal = hit.normal.clone().add(tangent.clone().scale(hit.offset * PADDLE_CURVE_RESPONSE)).normalize();
-      const repeatHit = this.lastTouchType === "player" && this.lastTouchPlayerId === player.id;
-
-      this.addCharge(player);
-      this.spawnPaddleImpactBurst(hit.contact, hit.radial, tangent);
-      this.playPaddleHitSound();
-
-      if (this.canCatchBall(player)) {
-        this.startCatch(player);
-        return;
-      }
-
-      if (this.velocity.dot(roundedNormal) < 0 || hit.crossed) {
-        this.reflectBall(roundedNormal);
-      }
-
-      if (repeatHit) {
-        this.boostBallSpeed(REPEAT_HIT_BOOST);
-        this.message = `${player.name} double-tapped the ball.`;
-      }
-      this.lastTouchType = "player";
-      this.lastTouchPlayerId = player.id;
-      this.ball.copy(hit.contact.add(roundedNormal.scale(BALL_RADIUS + PADDLE_RELEASE_GAP)));
-      this.trimBallTrail();
-      this.emitHud();
-      return;
-    }
-  }
-
-  private advanceBall(dt: number) {
-    const distance = this.velocity.length() * dt;
-    const steps = Math.max(1, Math.ceil(distance / (BALL_RADIUS * 0.65)));
-    const stepDt = dt / steps;
-
-    for (let index = 0; index < steps; index += 1) {
-      const previousBall = this.ball.clone();
-      this.ball.add(this.velocity.clone().scale(stepDt));
-      this.handleTriangleCollision();
-      this.handleArcBarrierCollisions(previousBall);
-      this.handlePaddleCollisions(previousBall);
-      this.handleGoals();
-
-      if (this.roundResolving || this.caughtByPlayerId !== undefined || this.mode !== "playing") {
-        return;
-      }
-    }
-  }
-
-  private paddleHitTest(arena: ArenaGeometry, player: PlayerState, previousBall?: Phaser.Math.Vector2): PaddleCollisionHit | undefined {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const segments = this.paddleCollisionSegments(arena, player);
-    let best:
-      | {
-        contact: Phaser.Math.Vector2;
-        distance: number;
-        offset: number;
-      }
-      | undefined;
-
-    for (const segment of segments) {
-      const contact = closestPointOnSegment(this.ball, segment.start, segment.end);
-      const distance = contact.distance(this.ball);
-      if (!best || distance < best.distance) {
-        best = { contact, distance, offset: segment.offset };
-      }
-    }
-
-    if (best && best.distance <= BALL_RADIUS) {
-      const normal = this.paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-      const separation = this.ball.clone().subtract(best.contact);
-      return {
-        contact: best.contact,
-        normal: separation.lengthSq() > 0.0001 ? separation.normalize() : normal,
-        radial,
-        offset: best.offset,
-        penetration: BALL_RADIUS - best.distance,
-        crossed: false
-      };
-    }
-
-    if (!previousBall) {
-      return undefined;
-    }
-
-    return this.paddleSweptHitTest(previousBall, arena, center, radial, tangent, segments);
-  }
-
-  private paddleSweptHitTest(
-    previousBall: Phaser.Math.Vector2,
-    arena: ArenaGeometry,
-    center: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    segments: PaddleSegment[]
-  ): PaddleCollisionHit | undefined {
-    const travel = this.ball.clone().subtract(previousBall);
-    if (travel.lengthSq() === 0) {
-      return undefined;
-    }
-
-    let best:
-      | {
-        contact: Phaser.Math.Vector2;
-        distance: number;
-        offset: number;
-      }
-      | undefined;
-
-    for (const segment of segments) {
-      const closest = closestPointsBetweenSegments(previousBall, this.ball, segment.start, segment.end);
-      if (closest.distance > BALL_RADIUS) {
-        continue;
-      }
-
-      if (!best || closest.distance < best.distance) {
-        best = {
-          contact: closest.b,
-          distance: closest.distance,
-          offset: segment.offset
-        };
-      }
-    }
-
-    if (!best) {
-      return undefined;
-    }
-
-    const separation = this.ball.clone().subtract(best.contact);
-    const normal = this.paddleHitNormal(arena, best.contact, best.offset, center, tangent, radial);
-
-    return {
-      contact: best.contact,
-      normal: separation.lengthSq() > 0.0001 ? separation.normalize() : normal,
-      radial,
-      offset: best.offset,
-      penetration: BALL_RADIUS - best.distance,
-      crossed: true
-    };
-  }
-
-  private paddleHitNormal(
-    arena: ArenaGeometry,
-    contact: Phaser.Math.Vector2,
-    offset: number,
-    center: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2
-  ) {
-    const halfHeight = this.paddleHalfHeight(arena);
-    const concaveHalfWidth = this.paddleConcaveHalfWidth(arena);
-    const local = contact.clone().subtract(center);
-    const localY = local.dot(radial);
-
-    if (localY > halfHeight * 0.5) {
-      return radial.clone();
-    }
-
-    const slope = this.paddleInnerSlope(Phaser.Math.Clamp(offset, -1, 1), concaveHalfWidth, halfHeight);
-    const curveNormal = tangent.clone().scale(slope).subtract(radial).normalize();
-    return curveNormal;
-  }
-
-  private paddleCollisionSegments(arena: ArenaGeometry, player: PlayerState): PaddleSegment[] {
-    const outline = this.paddleOutlinePoints(arena, player);
-    return outline.map((point, index) => {
-      const next = outline[(index + 1) % outline.length];
-      return {
-        start: point.position,
-        end: next.position,
-        offset: (point.offset + next.offset) / 2
-      };
-    });
-  }
-
-  private applyTriangleGravity(dt: number, minSpeed: number, maxSpeed: number) {
-    const arena = this.arena();
-    const towardTriangle = arena.center.clone().subtract(this.ball);
-    const distanceSq = Math.max(towardTriangle.lengthSq(), 1600);
-    const force = Math.min(48, TRIANGLE_GRAVITY / distanceSq);
-    this.velocity.add(towardTriangle.normalize().scale(force * dt));
-
-    const speed = this.velocity.length();
-    if (speed > 0) {
-      this.velocity.normalize().scale(Phaser.Math.Clamp(speed, minSpeed, maxSpeed));
-    }
-  }
-
-  private updateTriangleMotion(dt: number) {
-    if (this.triangleMotionMode === "steady") {
-      this.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
-    } else {
-      const sign = this.triangleAngularVelocity < 0 ? -1 : 1;
-      const damped = this.triangleAngularVelocity * Math.pow(TRIANGLE_REACTIVE_DAMPING, dt * 60);
-      this.triangleAngularVelocity = Math.abs(damped) < TRIANGLE_REACTIVE_MIN_SPEED
-        ? sign * TRIANGLE_REACTIVE_MIN_SPEED
-        : Phaser.Math.Clamp(damped, -TRIANGLE_REACTIVE_MAX_SPEED, TRIANGLE_REACTIVE_MAX_SPEED);
-    }
-
-    this.triangleRotation += this.triangleAngularVelocity * dt;
-  }
-
-  private handleTriangleCollision() {
-    const arena = this.arena();
-    const vertices = this.triangleVertices(arena);
-
-    if (pointInTriangle(this.ball, vertices[0], vertices[1], vertices[2])) {
-      this.triangleCollisionDisabledUntil = this.elapsed + TRIANGLE_PHASE_DELAY;
-      this.clearTouchState();
-      this.lastTouchType = "triangle";
-      return;
-    }
-
-    if (this.elapsed < this.triangleCollisionDisabledUntil) {
-      return;
-    }
-
-    for (let index = 0; index < vertices.length; index += 1) {
-      const start = vertices[index];
-      const end = vertices[(index + 1) % vertices.length];
-      const closest = closestPointOnSegment(this.ball, start, end);
-      const delta = this.ball.clone().subtract(closest);
-      const distance = delta.length();
-
-      if (distance >= BALL_RADIUS || distance === 0) {
-        continue;
-      }
-
-      const normal = delta.normalize();
-      this.applyTriangleReactiveImpulse(closest);
-      this.reflectBall(normal);
-      this.ball.copy(closest.add(normal.scale(BALL_RADIUS + 0.5)));
-      this.trimBallTrail();
-      this.clearTouchState();
-      this.lastTouchType = "triangle";
-      return;
-    }
-  }
-
-  private handleArcBarrierCollisions(previousBall?: Phaser.Math.Vector2) {
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-    const distance = fromCenter.length();
-    const barrierRadius = arena.radius - ARC_BARRIER_INSET;
-    const barrierHalfThickness = ARC_BARRIER_THICKNESS / 2;
-
-    if (distance < barrierRadius - barrierHalfThickness - BALL_RADIUS || distance > barrierRadius + barrierHalfThickness + BALL_RADIUS) {
-      return;
-    }
-
-    const angle = normalizeAngle(Math.atan2(fromCenter.y, fromCenter.x));
-    for (const barrierAngle of this.arcBarrierAngles()) {
-      if (Math.abs(shortestAngleDelta(barrierAngle, angle)) > ARC_BARRIER_HALF_ANGLE) {
-        continue;
-      }
-
-      const contact = pointOnCircle(arena.center, barrierAngle, barrierRadius);
-      const normal = fromCenter.lengthSq() > 0 ? fromCenter.normalize() : contact.clone().subtract(arena.center).normalize();
-      const movingAcross = previousBall ? previousBall.distance(this.ball) > 0 : false;
-      if (this.velocity.dot(normal) > 0 && !movingAcross) {
-        continue;
-      }
-
-      this.reflectBall(normal);
-      this.ball.copy(contact.add(normal.scale(BALL_RADIUS + barrierHalfThickness + 0.5)));
-      this.trimBallTrail();
-      return;
-    }
-  }
-
-  private applyTriangleReactiveImpulse(contact: Phaser.Math.Vector2) {
-    if (this.triangleMotionMode !== "reactive") {
-      return;
-    }
-
-    const arena = this.arena();
-    const lever = contact.clone().subtract(arena.center);
-    const incoming = this.velocity.clone();
-    const tangentPush = lever.x * incoming.y - lever.y * incoming.x;
-    const speedFactor = Phaser.Math.Clamp(incoming.length() / MAX_BALL_SPEED, 0.28, 1.35);
-    const direction = Math.sign(tangentPush) || Math.sign(this.triangleAngularVelocity) || 1;
-    const impulse = direction * Phaser.Math.Clamp(Math.abs(tangentPush) / Math.max(arena.triangleRadius * MAX_BALL_SPEED, 1), 0.22, 1.18) * speedFactor * 2.2;
-    this.triangleAngularVelocity = Phaser.Math.Clamp(
-      this.triangleAngularVelocity + impulse,
-      -TRIANGLE_REACTIVE_MAX_SPEED,
-      TRIANGLE_REACTIVE_MAX_SPEED
-    );
-  }
-
-  private handleGoals() {
-    if (this.roundResolving) {
-      return;
-    }
-
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-
-    if (fromCenter.length() <= arena.radius + BALL_RADIUS || this.elapsed - this.lastScoreAt < 350) {
-      return;
-    }
-
-    this.roundResolving = true;
-    this.clearTouchState();
-    this.clearCatchState();
-
-    const scorer = this.playerForAngle(normalizeAngle(Math.atan2(fromCenter.y, fromCenter.x)));
-    if (!scorer) {
-      this.resetRound();
-      return;
-    }
-
-    this.lastScoreAt = this.elapsed;
-    scorer.shields -= 1;
-    scorer.eliminated = scorer.shields <= 0;
-
-    if (scorer.eliminated) {
-      this.message = `${scorer.name} is out. The circle closes.`;
-      this.rebuildArcs();
-    } else {
-      this.message = `${scorer.name} cracked. ${scorer.shields} shields remain.`;
-    }
-
-    const remaining = this.activePlayers();
-    if (remaining.length <= 1) {
-      const winner = remaining[0];
-      this.message = `${winner?.name ?? "No one"} wins!`;
-      this.mode = "matchOver";
-      this.playWinFanfare();
-      this.spawnWinConfetti(winner);
-    } else {
-      this.time.delayedCall(420, () => {
-        if (this.mode === "playing") {
-          this.resetRound(scorer.paddleAngle);
+    for (const event of events) {
+      switch (event.kind) {
+        case "paddleHit": {
+          this.spawnPaddleImpactBurst(event.contact, event.radial, event.tangent, event.tangentSign);
+          this.playPaddleHitSound();
+          if (!event.caught) {
+            if (event.repeatHit) {
+              const player = this.playerById(event.playerId);
+              if (player) {
+                this.message = `${player.name} double-tapped the ball.`;
+              }
+            }
+            this.trimBallTrail();
+          }
+          hudDirty = true;
+          break;
         }
-      });
+        case "catchStart": {
+          const player = this.playerById(event.playerId);
+          if (player) {
+            this.message = `${player.name} caught the ball. Release Space to fire.`;
+          }
+          hudDirty = true;
+          break;
+        }
+        case "catchLaunch": {
+          const player = this.playerById(event.playerId);
+          if (player) {
+            this.message = `${player.name} fired the charged shot.`;
+          }
+          hudDirty = true;
+          break;
+        }
+        case "triangleHit":
+        case "barrierHit": {
+          this.trimBallTrail();
+          break;
+        }
+        case "goal": {
+          const scorer = this.playerById(event.scorerId);
+          if (scorer) {
+            this.message = event.eliminated
+              ? `${scorer.name} is out. The circle closes.`
+              : `${scorer.name} cracked. ${event.shieldsRemaining} shields remain.`;
+          }
+          // Sim left mode === "playing" → match continues; schedule the
+          // re-serve (sim itself never owns timers).
+          if (this.mode === "playing" && scorer) {
+            this.time.delayedCall(420, () => {
+              if (this.mode === "playing") {
+                this.resetRound(scorer.paddleAngle);
+              }
+            });
+          }
+          hudDirty = true;
+          break;
+        }
+        case "matchOver": {
+          const winner = event.winnerId === undefined ? undefined : this.playerById(event.winnerId);
+          this.message = `${winner?.name ?? "No one"} wins!`;
+          // Achievement: the human (slot-0 hot-seat) player won the offline match.
+          if (winner?.humanControlled) {
+            window.__arcadeHome?.unlockAchievement?.("four-ponq-win");
+          }
+          this.playWinFanfare();
+          this.spawnWinConfetti(winner);
+          hudDirty = true;
+          break;
+        }
+        case "serve": {
+          this.serveIndicatorDirection.set(event.direction.x, event.direction.y);
+          this.serveIndicatorUntil = this.mode === "playing" ? this.elapsed + SERVE_INDICATOR_LIFETIME : 0;
+          this.paddleImpactBursts = [];
+          this.ballTrail = [];
+          break;
+        }
+      }
     }
 
-    this.emitHud();
-  }
-
-  private reflectBall(normal: Phaser.Math.Vector2) {
-    const speed = Math.min(this.velocity.length() * 1.02, MAX_BALL_SPEED);
-    const reflected = this.velocity.clone().subtract(normal.clone().scale(2 * this.velocity.dot(normal)));
-    this.velocity.copy(reflected.normalize().scale(speed));
-  }
-
-  private boostBallSpeed(multiplier: number) {
-    const speed = this.velocity.length();
-    if (speed > 0) {
-      this.velocity.normalize().scale(Math.min(speed * multiplier, MAX_BALL_SPEED));
+    if (hudDirty) {
+      this.emitHud();
     }
   }
 
-  private addCharge(player: PlayerState) {
-    player.charge = Math.min(MAX_CHARGE, player.charge + 1);
+  private playerById(id: number) {
+    return this.players.find((player) => player.id === id);
   }
 
-  private canCatchBall(player: PlayerState) {
-    return player.humanControlled && player.charge >= MAX_CHARGE && this.keys.pause.isDown;
+  /**
+   * The view spin that puts the LOCAL player's home arc at screen-top (-PI/2),
+   * so that left/right always feel the same no matter which side of the circle
+   * you defend. Zero for offline play, spectators, the eliminated, and whoever
+   * already sits up top (slot 0) — those keep the default, un-rotated view.
+   */
+  private targetViewRotation(): number {
+    // Orbit mode: keep the camera FIXED so the sim's arena rotation
+    // (updateArenaRotation) is actually visible. Pinning the local arc to
+    // screen-top — what we do in classic — would exactly cancel the spin and
+    // the map would look static (the "orbit doesn't rotate the map" feedback).
+    if (this.gameVariant === "rotating") {
+      return 0;
+    }
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return 0;
+    }
+    const me = this.players[net.slot];
+    if (!me || me.eliminated) {
+      return 0;
+    }
+    const homeCenter = me.arcStart + (me.arcEnd - me.arcStart) / 2;
+    // Rotation R such that homeCenter renders at screen-top: homeCenter + R = -PI/2.
+    return shortestAngleDelta(homeCenter, -Math.PI / 2);
   }
 
-  private startCatch(player: PlayerState) {
-    this.caughtByPlayerId = player.id;
-    this.caughtAt = this.elapsed;
-    this.caughtLaunchSpeed = Math.max(this.velocity.length(), 360);
-    this.velocity.set(0, 0);
-    this.updateCaughtBall();
-    this.lastTouchType = "player";
-    this.lastTouchPlayerId = player.id;
-    this.message = `${player.name} caught the ball. Release Space to fire.`;
-    this.emitHud();
-  }
+  /**
+   * Ease the camera toward {@link targetViewRotation} and pivot it about the
+   * arena centre (Phaser rotates a camera around its own midpoint, so we park
+   * the arena centre there via scroll). Re-orienting on elimination glides
+   * instead of snapping.
+   */
+  private applyViewTransform(arena: ArenaGeometry) {
+    const target = this.targetViewRotation();
+    const delta = shortestAngleDelta(this.currentViewRotation, target);
+    this.currentViewRotation = Math.abs(delta) < 0.0008 ? target : this.currentViewRotation + delta * 0.18;
 
-  private updateCaughtBall() {
-    const player = this.players.find((entry) => entry.id === this.caughtByPlayerId && !entry.eliminated);
-    if (!player) {
-      this.clearCatchState();
+    const cam = this.cameras.main;
+    if (Math.abs(shortestAngleDelta(this.currentViewRotation, 0)) < 0.0008) {
+      this.currentViewRotation = 0;
+      cam.setRotation(0);
+      cam.setScroll(0, 0);
       return;
     }
-
-    this.ball.copy(this.paddleCatchPoint(this.arena(), player));
-  }
-
-  private launchCaughtBall() {
-    const player = this.players.find((entry) => entry.id === this.caughtByPlayerId && !entry.eliminated);
-    if (!player) {
-      this.clearCatchState();
-      return;
-    }
-
-    const arena = this.arena();
-    const radial = this.paddleCenter(arena, player).subtract(arena.center).normalize();
-    const launchSpeed = Math.min(Math.max(BASE_BALL_SPEED, this.caughtLaunchSpeed) * CATCH_LAUNCH_BOOST, MAX_CHARGED_BALL_SPEED);
-    this.ball.copy(this.paddleCatchPoint(arena, player));
-    this.velocity.copy(radial.scale(-launchSpeed));
-    player.charge = 0;
-    this.lastTouchType = "player";
-    this.lastTouchPlayerId = player.id;
-    this.clearCatchState();
-    this.message = `${player.name} fired the charged shot.`;
-    this.emitHud();
-  }
-
-  private clearCatchState() {
-    this.caughtByPlayerId = undefined;
-    this.caughtAt = 0;
-    this.caughtLaunchSpeed = 0;
-  }
-
-  private clearTouchState() {
-    this.lastTouchType = "none";
-    this.lastTouchPlayerId = undefined;
+    cam.setScroll(arena.center.x - this.scale.width / 2, arena.center.y - this.scale.height / 2);
+    cam.setRotation(this.currentViewRotation);
   }
 
   private renderArena() {
@@ -996,6 +1194,11 @@ class FourPongScene extends Phaser.Scene {
     const arena = this.arena();
     const theme = this.activeTheme();
 
+    this.applyViewTransform(arena);
+
+    // Fill behind the (possibly rotated) world so the viewport corners never
+    // show through once the camera spins.
+    this.cameras.main.setBackgroundColor(theme.background);
     this.gfx.clear();
     this.gfx.fillStyle(theme.background, 1);
     this.gfx.fillRect(0, 0, width, height);
@@ -1004,6 +1207,9 @@ class FourPongScene extends Phaser.Scene {
     this.drawPlayerArcs(arena);
     this.drawTriangle(arena, theme);
     this.drawPaddles(arena);
+    this.drawChargeGlow(arena);
+    this.drawPaddleClusters(arena);
+    this.drawSeatFlash(arena);
     this.drawBallTrail(theme);
     this.drawServeIndicator(theme);
     this.drawPaddleImpactBursts();
@@ -1033,7 +1239,16 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private drawTriangle(arena: ArenaGeometry, theme: ThemeDefinition) {
-    const vertices = this.triangleVertices(arena);
+    // Networked: render the interpolated SERVER pose so the drawn centre piece is
+    // the exact surface the authoritative ball bounces off. Offline: local sim spin.
+    const rotation = this.networked && this.netTriangleRotation !== null
+      ? this.netTriangleRotation
+      : this.sim.triangleRotation;
+    if (this.centerShape === "trinity") {
+      this.drawTrinity(arena, theme, rotation);
+      return;
+    }
+    const vertices = triangleVertices(arena, rotation);
     this.gfx.fillStyle(theme.triangleFill, 1);
     this.gfx.lineStyle(2, theme.triangleStroke, 0.62);
     this.gfx.beginPath();
@@ -1055,6 +1270,29 @@ class FourPongScene extends Phaser.Scene {
     this.gfx.strokePath();
   }
 
+  /**
+   * Hollow Trinity: a broken ring of 3 concave arcs with 3 wide gaps. Drawn from
+   * the same interpolated rotation as the triangle so the rendered walls match the
+   * surface the authoritative ball bounces off. Stroke width = 2*halfThickness with
+   * rounded end caps, matching the collision capsule so visual and physics agree.
+   */
+  private drawTrinity(arena: ArenaGeometry, theme: ThemeDefinition, rotation: number) {
+    const ringRadius = centerChamberRadius(arena);
+    const half = TRINITY_SEGMENT_HALF_THICKNESS;
+    this.gfx.lineStyle(half * 2, theme.triangleStroke, 0.92);
+    this.gfx.fillStyle(theme.triangleStroke, 0.92);
+    for (const arc of centerArcs(arena, rotation)) {
+      this.gfx.beginPath();
+      this.gfx.arc(arena.center.x, arena.center.y, ringRadius, arc.a0, arc.a1, false);
+      this.gfx.strokePath();
+      // Rounded caps at the gap edges (Phaser arc strokes are butt-capped).
+      const p0 = pointOnCircle(arena.center, arc.a0, ringRadius);
+      const p1 = pointOnCircle(arena.center, arc.a1, ringRadius);
+      this.gfx.fillCircle(p0.x, p0.y, half);
+      this.gfx.fillCircle(p1.x, p1.y, half);
+    }
+  }
+
   private drawPaddles(arena: ArenaGeometry) {
     for (const player of this.activePlayers()) {
       this.gfx.fillStyle(player.color, 1);
@@ -1067,8 +1305,231 @@ class FourPongScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * Pulsing halo around the LOCAL player's paddle while their super is ready to
+   * grab (charge >= CHARGE_READY_AT). Answers the "I barely know when my super
+   * is charged" feedback at a glance, right where the player is already looking.
+   * World-space so it tracks the per-client view rotation.
+   */
+  private drawChargeGlow(arena: ArenaGeometry) {
+    const slot = this.localSlot();
+    if (slot < 0) {
+      return;
+    }
+    const player = this.players[slot];
+    if (!player || player.eliminated || player.charge < CHARGE_READY_AT) {
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.012);
+    const pos = paddleCenter(arena, player);
+    this.gfx.lineStyle(3, 0xffffff, 0.22 + 0.4 * pulse);
+    this.gfx.strokeCircle(pos.x, pos.y, 22 + pulse * 7);
+    this.gfx.lineStyle(6, player.color, 0.28 + 0.5 * pulse);
+    this.gfx.strokeCircle(pos.x, pos.y, 34 + pulse * 9);
+  }
+
+  /**
+   * One-time setup of the per-slot in-arena HUD pool: a transparent placeholder
+   * texture plus one avatar Image + one initial-letter Text per slot. They live
+   * at depth 10/11 (above the single immediate-mode gfx layer) and are merely
+   * re-positioned each frame in drawPaddleClusters — never re-created.
+   */
+  private createClusterHud() {
+    if (!this.textures.exists(AVATAR_BLANK_TEX)) {
+      const blank = this.make.graphics({ x: 0, y: 0 }, false);
+      blank.fillStyle(0xffffff, 0);
+      blank.fillRect(0, 0, 2, 2);
+      blank.generateTexture(AVATAR_BLANK_TEX, 2, 2);
+      blank.destroy();
+    }
+    for (let i = 0; i < this.players.length; i += 1) {
+      this.avatarSprites.push(
+        this.add.image(0, 0, AVATAR_BLANK_TEX).setVisible(false).setDepth(10)
+      );
+      this.clusterInitials.push(
+        this.add
+          .text(0, 0, "", { fontFamily: "Arial, sans-serif", color: "#ffffff", fontStyle: "bold" })
+          .setOrigin(0.5)
+          .setVisible(false)
+          .setDepth(11)
+      );
+    }
+  }
+
+  /**
+   * Kick off a one-time fetch + decode of a peer's hub doodle avatar by public
+   * id (mirrors the hub-chat avatar pattern: public, email-free lookup). The
+   * decoded PNG becomes a Phaser texture the cluster renderer draws behind that
+   * player's section. Best-effort — bots / no-profile / offline fall back to the
+   * name-initial disc.
+   */
+  private ensureAvatar(publicId: string) {
+    if (!publicId || this.avatarState.has(publicId)) {
+      return;
+    }
+    this.avatarState.set(publicId, "loading");
+    fetch(`/api/profile/by-id/${encodeURIComponent(publicId)}`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { profile?: { avatar?: unknown } } | null) => {
+        const avatar = data && typeof data.profile?.avatar === "string" ? data.profile.avatar : "";
+        if (avatar) {
+          this.loadAvatarTexture(publicId, avatar);
+        } else {
+          this.avatarState.set(publicId, "failed");
+        }
+      })
+      .catch(() => this.avatarState.set(publicId, "failed"));
+  }
+
+  /** Decode a `data:image/png;…` doodle into a Phaser texture keyed by public id. */
+  private loadAvatarTexture(publicId: string, dataUrl: string) {
+    const key = avatarTexKey(publicId);
+    if (this.textures.exists(key)) {
+      this.avatarState.set(publicId, "ready");
+      return;
+    }
+    this.avatarState.set(publicId, "loading");
+    const img = new Image();
+    img.onload = () => {
+      if (!this.textures.exists(key)) {
+        this.textures.addImage(key, img);
+      }
+      this.avatarState.set(publicId, "ready");
+    };
+    img.onerror = () => this.avatarState.set(publicId, "failed");
+    img.src = dataUrl;
+  }
+
+  /**
+   * Per-player HUD drawn IN-ARENA behind each paddle's section (answers the
+   * "lives/super resting behind the user's section, not top-left" feedback):
+   * a backing disc with the hub doodle avatar (or a name-initial fallback), a
+   * super-charge ring that fills + pulses when ready, and a row of lives pips
+   * just outside the goal ring. Anchored at the section's arc midpoint so it
+   * sits still rather than chasing the moving paddle. The disc/ring/pips are
+   * rotation-agnostic and ride the camera spin; the avatar/initial counter-
+   * rotate so they stay upright for whoever's view is on top.
+   */
+  private drawPaddleClusters(arena: ArenaGeometry) {
+    const net = this.net;
+    const localSlot = this.localSlot();
+    const center = arena.center;
+    const discR = Phaser.Math.Clamp(arena.radius * 0.07, 12, 17);
+    const pipRingR = arena.radius + 7;
+    const discCenterR = arena.radius + discR + 11;
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.012);
+
+    for (let i = 0; i < this.players.length; i += 1) {
+      const player = this.players[i];
+      const sprite = this.avatarSprites[i];
+      const initial = this.clusterInitials[i];
+      if (!sprite || !initial) {
+        continue;
+      }
+      // Stable section centre (arc midpoint), not the moving paddle angle.
+      const angle = (player.arcStart + player.arcEnd) / 2;
+      const discPos = pointOnCircle(center, angle, discCenterR);
+      const dim = player.eliminated ? 0.4 : 1;
+      const isSelf = i === localSlot;
+
+      // Backing disc.
+      this.gfx.fillStyle(player.color, 0.16 * dim);
+      this.gfx.fillCircle(discPos.x, discPos.y, discR + 3);
+      // Super-charge ring: dim track + a coloured progress arc from the top.
+      this.gfx.lineStyle(3, 0xffffff, 0.12 * dim);
+      this.gfx.strokeCircle(discPos.x, discPos.y, discR + 3);
+      const frac = Phaser.Math.Clamp(player.charge / CHARGE_READY_AT, 0, 1);
+      if (frac > 0 && !player.eliminated) {
+        const a0 = -Math.PI / 2;
+        this.gfx.lineStyle(3, player.color, 0.95);
+        this.gfx.beginPath();
+        this.gfx.arc(discPos.x, discPos.y, discR + 3, a0, a0 + TAU * frac, false);
+        this.gfx.strokePath();
+      }
+      // Ready: unmistakable pulsing halo (the per-player "super up" tell).
+      if (!player.eliminated && player.charge >= CHARGE_READY_AT) {
+        this.gfx.lineStyle(4, 0xffffff, 0.25 + 0.45 * pulse);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 6 + pulse * 4);
+        this.gfx.lineStyle(3, player.color, 0.4 + 0.5 * pulse);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 9 + pulse * 5);
+      }
+      // Self marker.
+      if (isSelf) {
+        this.gfx.lineStyle(2, 0xffffff, 0.8 * dim);
+        this.gfx.strokeCircle(discPos.x, discPos.y, discR + 6);
+      }
+
+      // Avatar image if its texture is ready, else the name-initial fallback.
+      const pv = net?.players.find((p) => p.slot === i);
+      const publicId = pv?.publicId || (isSelf ? this.localPublicId : "");
+      const ready = !!publicId && this.avatarState.get(publicId) === "ready";
+      if (ready) {
+        sprite.setTexture(avatarTexKey(publicId));
+        sprite.setDisplaySize(discR * 2, discR * 2);
+        sprite.setPosition(discPos.x, discPos.y);
+        sprite.setRotation(-this.currentViewRotation);
+        sprite.setAlpha(dim);
+        sprite.setVisible(true);
+        initial.setVisible(false);
+      } else {
+        sprite.setVisible(false);
+        initial.setText((player.name.trim()[0] || "?").toUpperCase());
+        initial.setColor(player.cssColor);
+        initial.setFontSize(Math.round(discR * 1.4));
+        initial.setPosition(discPos.x, discPos.y);
+        initial.setRotation(-this.currentViewRotation);
+        initial.setAlpha(dim);
+        initial.setVisible(true);
+      }
+
+      // Lives pips, fanned along the goal ring just outside it.
+      const spread = 0.045;
+      for (let p = 0; p < MAX_SHIELDS; p += 1) {
+        const pa = angle + (p - (MAX_SHIELDS - 1) / 2) * spread;
+        const pip = pointOnCircle(center, pa, pipRingR);
+        if (p < player.shields && !player.eliminated) {
+          this.gfx.fillStyle(player.color, 0.95);
+          this.gfx.fillCircle(pip.x, pip.y, 3.2);
+        } else {
+          this.gfx.fillStyle(0xffffff, 0.18 * dim);
+          this.gfx.fillCircle(pip.x, pip.y, 2.6);
+        }
+      }
+    }
+  }
+
+  /**
+   * Brief expanding pulse around OUR OWN paddle right after the server seats
+   * us (see handleSeated) — the "which paddle is mine?" answer for someone who
+   * just jumped in from spectating.
+   */
+  private drawSeatFlash(arena: ArenaGeometry) {
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return;
+    }
+    const remaining = this.seatFlashUntil - this.elapsed;
+    if (remaining <= 0) {
+      return;
+    }
+    const player = this.players[net.slot];
+    if (!player || player.eliminated) {
+      return;
+    }
+
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 0.02);
+    const fade = Phaser.Math.Clamp(remaining / 600, 0, 1);
+    const pos = paddleCenter(arena, player);
+
+    this.gfx.lineStyle(3, 0xffffff, fade * (0.32 + 0.4 * pulse));
+    this.gfx.strokeCircle(pos.x, pos.y, 26 + pulse * 8);
+    this.gfx.lineStyle(5, player.color, fade * (0.28 + 0.5 * pulse));
+    this.gfx.strokeCircle(pos.x, pos.y, 40 + pulse * 10);
+  }
+
   private traceConcavePaddle(arena: ArenaGeometry, player: PlayerState) {
-    const outline = this.paddleOutlinePoints(arena, player);
+    const outline = paddleOutlinePoints(arena, player);
     outline.forEach((point, index) => {
       if (index === 0) {
         this.gfx.moveTo(point.position.x, point.position.y);
@@ -1076,114 +1537,6 @@ class FourPongScene extends Phaser.Scene {
         this.gfx.lineTo(point.position.x, point.position.y);
       }
     });
-  }
-
-  private paddleOutlinePoints(arena: ArenaGeometry, player: PlayerState) {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const concaveHalfWidth = this.paddleConcaveHalfWidth(arena);
-    const halfWidth = this.paddleHalfWidth(arena);
-    const halfHeight = this.paddleHalfHeight(arena);
-    const steps = 18;
-    const points: Array<{ position: Phaser.Math.Vector2; offset: number }> = [];
-
-    points.push({
-      position: this.paddleOuterPoint(arena, player, -halfWidth),
-      offset: -1
-    });
-
-    for (let index = 0; index <= steps; index += 1) {
-      const offset = -1 + index / steps * 2;
-      points.push({
-        position: this.paddleOuterPoint(arena, player, offset * concaveHalfWidth),
-        offset
-      });
-    }
-
-    points.push({
-      position: this.paddleOuterPoint(arena, player, halfWidth),
-      offset: 1
-    });
-    points.push({
-      position: this.paddleLocalPoint(center, tangent, radial, halfWidth, this.paddleInnerY(1, halfHeight)),
-      offset: 1
-    });
-
-    for (let index = steps; index >= 0; index -= 1) {
-      const offset = -1 + index / steps * 2;
-      points.push({
-        position: this.paddleLocalPoint(center, tangent, radial, offset * concaveHalfWidth, this.paddleInnerY(offset, halfHeight)),
-        offset
-      });
-    }
-
-    points.push({
-      position: this.paddleLocalPoint(center, tangent, radial, -halfWidth, this.paddleInnerY(-1, halfHeight)),
-      offset: -1
-    });
-
-    return points;
-  }
-
-  private paddleOuterPoint(arena: ArenaGeometry, player: PlayerState, localX: number) {
-    return pointOnCircle(arena.center, player.paddleAngle + localX / arena.radius, arena.radius);
-  }
-
-  private paddleCenter(arena: ArenaGeometry, player: PlayerState) {
-    return pointOnCircle(arena.center, player.paddleAngle, arena.radius - this.paddleHalfHeight(arena));
-  }
-
-  private paddleCatchPoint(arena: ArenaGeometry, player: PlayerState) {
-    const center = this.paddleCenter(arena, player);
-    const radial = center.clone().subtract(arena.center).normalize();
-    const tangent = new Phaser.Math.Vector2(-radial.y, radial.x);
-    const innerY = this.paddleInnerY(0, this.paddleHalfHeight(arena));
-    return this.paddleLocalPoint(center, tangent, radial, 0, innerY - BALL_RADIUS - PADDLE_RELEASE_GAP);
-  }
-
-  private paddleHalfWidth(arena: ArenaGeometry) {
-    return this.paddleConcaveHalfWidth(arena) + this.paddleWingLength(arena);
-  }
-
-  private paddleConcaveHalfWidth(arena: ArenaGeometry) {
-    return Math.max(37, arena.radius * arena.paddleAngleSpan * 0.54);
-  }
-
-  private paddleWingLength(arena: ArenaGeometry) {
-    return Math.max(PADDLE_WING_LENGTH_MIN, arena.radius * PADDLE_WING_LENGTH_RATIO);
-  }
-
-  private paddleHalfHeight(arena: ArenaGeometry) {
-    return Math.max(14, arena.paddleThickness * 0.74);
-  }
-
-  private paddleInnerY(offset: number, halfHeight: number) {
-    const endDip = halfHeight * 0.12;
-    return -halfHeight + halfHeight * PADDLE_CONCAVITY * (1 - offset * offset) - endDip * offset * offset;
-  }
-
-  private paddleInnerSlope(offset: number, halfWidth: number, halfHeight: number) {
-    return (-2 * halfHeight * (PADDLE_CONCAVITY + 0.12) * offset) / halfWidth;
-  }
-
-  private paddleLocalPoint(
-    center: Phaser.Math.Vector2,
-    tangent: Phaser.Math.Vector2,
-    radial: Phaser.Math.Vector2,
-    x: number,
-    y: number
-  ) {
-    return center.clone().add(tangent.clone().scale(x)).add(radial.clone().scale(y));
-  }
-
-  private paddleSpeedMultiplier() {
-    const completedRounds = Math.max(0, this.roundNumber - 1);
-    return Math.min(MAX_PADDLE_SPEED_MULTIPLIER, 1 + completedRounds * PADDLE_SPEED_RAMP);
-  }
-
-  private variantPaddleSpeedMultiplier() {
-    return this.gameVariant === "rotating" ? ROTATING_VARIANT_PADDLE_SPEED_BOOST : 1;
   }
 
   private drawBall(theme: ThemeDefinition) {
@@ -1247,14 +1600,13 @@ class FourPongScene extends Phaser.Scene {
     }];
   }
 
-  private spawnPaddleImpactBurst(contact: Phaser.Math.Vector2, radial: Phaser.Math.Vector2, tangent: Phaser.Math.Vector2) {
-    const tangentDrift = this.velocity.dot(tangent);
-    const tangentSign = tangentDrift === 0 ? 1 : -Math.sign(tangentDrift);
-
+  // tangentSign arrives with the SimEvent (it depends on the pre-reflection
+  // ball velocity, which is gone by the time the scene processes events).
+  private spawnPaddleImpactBurst(contact: Vec2, radial: Vec2, tangent: Vec2, tangentSign: number) {
     this.paddleImpactBursts.push({
-      position: contact.clone(),
-      radial: radial.clone().normalize(),
-      tangent: tangent.clone().normalize(),
+      position: new Phaser.Math.Vector2(contact.x, contact.y),
+      radial: new Phaser.Math.Vector2(radial.x, radial.y).normalize(),
+      tangent: new Phaser.Math.Vector2(tangent.x, tangent.y).normalize(),
       tangentSign,
       createdAt: this.elapsed
     });
@@ -1297,13 +1649,28 @@ class FourPongScene extends Phaser.Scene {
     }
 
     const key = PADDLE_HIT_SOUND_KEYS[Phaser.Math.Between(0, PADDLE_HIT_SOUND_KEYS.length - 1)];
-    this.sound.play(key, { volume: PADDLE_HIT_SOUND_VOLUME * this.sfxVolume });
+    this.sound.play(key, { volume: this.sfxGain(PADDLE_HIT_SOUND_VOLUME) });
     this.lastPaddleHitSoundAt = this.elapsed;
   }
 
   private playWinFanfare() {
     const key = WIN_FANFARE_KEYS[Phaser.Math.Between(0, WIN_FANFARE_KEYS.length - 1)];
-    this.sound.play(key, { volume: WIN_FANFARE_VOLUME * this.sfxVolume });
+    this.sound.play(key, { volume: this.sfxGain(WIN_FANFARE_VOLUME) });
+  }
+
+  /** 3-2-1 tick — a fixed bright clonk so every second sounds identical. */
+  private playCountdownTick() {
+    this.sound.play("paddle-clonk-06", { volume: this.sfxGain(COUNTDOWN_TICK_VOLUME) });
+  }
+
+  /** Actual music gain = slider fraction, capped by the master ceiling. */
+  private musicGain(): number {
+    return this.musicVolume * VOLUME_CEILING;
+  }
+
+  /** Actual SFX gain for a sound = its base level x slider fraction x ceiling. */
+  private sfxGain(base: number): number {
+    return base * this.sfxVolume * VOLUME_CEILING;
   }
 
   private updateMusic() {
@@ -1322,19 +1689,23 @@ class FourPongScene extends Phaser.Scene {
       this.stopMusic();
       this.activeMusic = this.sound.add(track.key, {
         loop: true,
-        volume: this.musicVolume
+        volume: this.musicGain()
       });
       this.activeMusicKey = track.key;
     }
 
-    this.setSoundVolume(this.activeMusic, this.musicVolume);
+    this.setSoundVolume(this.activeMusic, this.musicGain());
     if (this.activeMusic && !this.activeMusic.isPlaying) {
       this.activeMusic.play();
     }
   }
 
   private currentMusicTrack() {
-    if (this.roundNumber <= 0 || this.mode !== "playing") {
+    // Networked mode never advances the local sim's roundNumber, so gate music
+    // on "server says we're playing" instead (the 3-2-1 countdown mirrors local
+    // mode "playing" but should stay music-free). Offline keeps the original gate.
+    const roundLive = this.networked ? this.net?.mode === "playing" : this.sim.roundNumber > 0;
+    if (!roundLive || this.mode !== "playing") {
       return undefined;
     }
 
@@ -1373,7 +1744,7 @@ class FourPongScene extends Phaser.Scene {
     const normalized = Phaser.Math.Clamp(volume, 0, 1);
     if (target === "music") {
       this.musicVolume = normalized;
-      this.setSoundVolume(this.activeMusic, this.musicVolume);
+      this.setSoundVolume(this.activeMusic, this.musicGain());
     } else {
       this.sfxVolume = normalized;
     }
@@ -1454,67 +1825,13 @@ class FourPongScene extends Phaser.Scene {
     }
   }
 
-  private rebuildArcs() {
-    const active = this.activePlayers();
-    const span = TAU / Math.max(active.length, 1);
-    const startOffset = -Math.PI / 2 - span / 2;
-
-    active.forEach((player, index) => {
-      player.arcStart = normalizeAngle(startOffset + index * span);
-      player.arcEnd = player.arcStart + span;
-      player.paddleAngle = normalizeAngle(player.arcStart + span / 2);
-      this.clampPaddleToArc(player);
-    });
-  }
-
-  private updateArenaRotation(dt: number) {
-    if (this.gameVariant !== "rotating") {
-      return;
-    }
-
-    const rotation = ARENA_ROTATION_SPEED * dt;
-    for (const player of this.activePlayers()) {
-      player.arcStart += rotation;
-      player.arcEnd += rotation;
-      player.paddleAngle = normalizeAngle(player.paddleAngle + rotation);
-      this.clampPaddleToArc(player);
-    }
-  }
-
+  /**
+   * Thin wrapper over the sim's resetRound: runs the pure serve math, then
+   * routes the resulting "serve" event through applySimEvents (which sets the
+   * serve indicator and clears trails/bursts, like the old method did).
+   */
   private resetRound(targetAngle?: number, countRound = true) {
-    const arena = this.arena();
-    const angle = normalizeAngle((targetAngle ?? Phaser.Math.FloatBetween(0, TAU)) + Phaser.Math.FloatBetween(-0.32, 0.32));
-    const speed = this.mode === "menu" ? MENU_BALL_SPEED : BASE_BALL_SPEED;
-
-    if (countRound && this.mode === "playing") {
-      this.roundNumber += 1;
-    }
-
-    this.ball.copy(arena.center);
-    this.velocity.set(Math.cos(angle) * speed, Math.sin(angle) * speed);
-    this.serveIndicatorDirection.copy(this.velocity.clone().normalize());
-    this.serveIndicatorUntil = this.mode === "playing" ? this.elapsed + SERVE_INDICATOR_LIFETIME : 0;
-    this.triangleCollisionDisabledUntil = this.elapsed + TRIANGLE_PHASE_DELAY;
-    this.roundReadyAt = this.mode === "playing" ? this.elapsed + SPAWN_DELAY : 0;
-    this.roundResolving = false;
-    this.clearTouchState();
-    this.clearCatchState();
-    this.paddleImpactBursts = [];
-    this.ballTrail = [];
-  }
-
-  private previewMenuMotion(dt: number) {
-    this.applyTriangleGravity(dt, 150, 260);
-    this.ball.add(this.velocity.clone().scale(dt));
-    this.handleTriangleCollision();
-
-    const arena = this.arena();
-    const fromCenter = this.ball.clone().subtract(arena.center);
-    if (fromCenter.length() > arena.radius * 0.72) {
-      const normal = fromCenter.normalize();
-      this.reflectBall(normal);
-      this.ball.copy(arena.center.clone().add(normal.scale(arena.radius * 0.72)));
-    }
+    this.applySimEvents(simResetRound(this.sim, this.arena(), this.rng, targetAngle, countRound));
   }
 
   public togglePause() {
@@ -1523,29 +1840,97 @@ class FourPongScene extends Phaser.Scene {
     }
 
     this.mode = this.mode === "paused" ? "playing" : "paused";
-    this.message = this.mode === "paused" ? "Paused. Press Esc, Space, or Resume." : "Back in motion.";
+    this.message = this.mode === "paused" ? "Paused. Press Esc, Space, or Resume to continue." : "Back in motion.";
+    if (this.mode === "playing") {
+      this.resumeRoundIfStalled();
+    }
     this.emitHud();
   }
 
+  /**
+   * handleGoals() schedules resetRound via delayedCall gated on
+   * mode === "playing". Pausing inside that window drops the reset and
+   * leaves roundResolving stuck true (frozen ball). Every resume path calls
+   * this to re-serve if that happened.
+   */
+  private resumeRoundIfStalled() {
+    if (this.sim.roundResolving) {
+      this.resetRound();
+    }
+  }
+
+  /**
+   * Networked gameplay settings are HOST-ONLY and server-authoritative: only the
+   * host (lowest-slot human, "P1") may change them, and only on a ready screen.
+   * We route the change to the server and let the {t:"room"} echo apply it (so
+   * every client agrees); offline keeps the original local mutation.
+   */
+  private rejectNonHostSetting(): boolean {
+    if (this.networked && this.net && !this.net.isHost) {
+      this.message = "Only the host (P1) sets the rules.";
+      this.emitHud();
+      return true;
+    }
+    return false;
+  }
+
   private toggleBotFill() {
+    // Networked: bot-fill is a host-only server setting; ask the server to flip
+    // it and let the next {t:"room"} echo it back. Don't mutate local sim state.
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetBots(!this.net.botFill);
+      return;
+    }
+
     this.botFill = !this.botFill;
     this.message = this.botFill ? "Bot fill on for computer opponents. P1 stays yours." : "Bot fill off. P1 has the circle.";
     this.emitHud();
   }
 
   private setBotDifficulty(difficulty: BotDifficulty) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("difficulty", difficulty);
+      return;
+    }
     this.botDifficulty = difficulty;
     this.message = `Computer difficulty set to ${difficulty}.`;
     this.emitHud();
   }
 
   private setGameVariant(variant: GameVariant) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("gameVariant", variant);
+      return;
+    }
     this.gameVariant = variant;
-    this.message = variant === "rotating" ? "Orbit mode on. The whole circle rotates clockwise." : "Classic mode on. The arena holds steady.";
+    this.message = variant === "rotating" ? "Orbit mode on. The whole circle rotates clockwise — your paddle rides around with it." : "Classic mode on. The arena holds steady.";
+    this.emitHud();
+  }
+
+  private setCenterShape(shape: CenterShape) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("centerShape", shape);
+      return;
+    }
+    this.centerShape = shape;
+    this.message = shape === "trinity" ? "Center set to Hollow Trinity — bank shots through the gaps." : "Center set to the classic triangle.";
     this.emitHud();
   }
 
   private setTheme(themeId: ThemeId) {
+    // Theme is a per-client cosmetic preference — always local, never host-locked.
     this.themeId = themeId;
     this.applyPlayerTheme();
     this.message = `Theme set to ${this.activeTheme().name}.`;
@@ -1553,9 +1938,16 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private setTriangleMotionMode(mode: TriangleMotionMode) {
+    if (this.networked && this.net) {
+      if (this.rejectNonHostSetting()) {
+        return;
+      }
+      this.net.sendSetting("triangleMotion", mode);
+      return;
+    }
     this.triangleMotionMode = mode;
     if (mode === "steady") {
-      this.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
+      this.sim.triangleAngularVelocity = TRIANGLE_ROTATION_SPEED;
     }
     this.message = mode === "steady" ? "Triangle motion set to steady spin." : "Triangle motion set to reactive hits.";
     this.emitHud();
@@ -1575,28 +1967,7 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private arena(): ArenaGeometry {
-    const width = this.scale.width || 960;
-    const height = this.scale.height || 640;
-    const hudSafeTop = width < 760 ? 142 : 92;
-    const controlsSafeBottom = width < 760 ? 118 : 70;
-    const centerY = hudSafeTop + (height - hudSafeTop - controlsSafeBottom) / 2;
-    const radius = Math.max(126, Math.min(width * 0.43, (height - hudSafeTop - controlsSafeBottom) * 0.48));
-
-    return {
-      center: new Phaser.Math.Vector2(width / 2, centerY),
-      radius,
-      paddleThickness: Math.max(16, Math.min(24, radius * 0.085)),
-      paddleAngleSpan: Math.max(0.252, Math.min(0.468, 68.4 / radius)),
-      triangleRadius: Math.max(32, Math.min(56, radius * 0.18))
-    };
-  }
-
-  private triangleVertices(arena: ArenaGeometry) {
-    return [0, 1, 2].map((index) => pointOnCircle(arena.center, this.triangleRotation + index * TAU / 3, arena.triangleRadius));
-  }
-
-  private playerForAngle(angle: number) {
-    return this.activePlayers().find((player) => angleInArc(angle, player.arcStart, player.arcEnd));
+    return computeArena(this.scale.width || 960, this.scale.height || 640);
   }
 
   private activePlayers() {
@@ -1604,42 +1975,79 @@ class FourPongScene extends Phaser.Scene {
   }
 
   private lastTouchPlayer() {
-    return this.players.find((player) => player.id === this.lastTouchPlayerId);
+    return this.players.find((player) => player.id === this.sim.lastTouchPlayerId);
   }
 
-  private arcBarrierAngles() {
-    const active = this.activePlayers();
-    const angles: number[] = [];
-    for (const player of active) {
-      if (!angles.some((angle) => Math.abs(shortestAngleDelta(angle, player.arcStart)) < 0.001)) {
-        angles.push(normalizeAngle(player.arcStart));
-      }
-    }
-    return angles;
-  }
-
-  private clampPaddleToArc(player: PlayerState) {
-    player.paddleAngle = clampAngleToArc(player.paddleAngle, player.arcStart, player.arcEnd, this.paddleSafetyMargin(player));
-  }
-
-  private paddleSafetyMargin(player: PlayerState) {
-    const arena = this.arena();
-    const span = player.arcEnd - player.arcStart;
-    const halfPaddleAngle = this.paddleHalfWidth(arena) / arena.radius + 0.01;
-    return Math.min(span * 0.46, Math.max(0.04, halfPaddleAngle));
-  }
-
-  private handleResize() {
-    if (this.caughtByPlayerId !== undefined) {
-      this.updateCaughtBall();
+  private handleResize(
+    gameSize: Phaser.Structs.Size,
+    _baseSize: Phaser.Structs.Size,
+    _displaySize: Phaser.Structs.Size,
+    previousWidth: number,
+    previousHeight: number
+  ) {
+    if (this.sim.caughtByPlayerId !== undefined) {
+      updateCaughtBall(this.sim, this.arena());
       return;
     }
 
-    this.resetRound(undefined, false);
+    // Remap the ball into the new arena instead of re-serving: window drags,
+    // devtools, and overlay reflows no longer reset the round mid-rally.
+    const old = computeArena(previousWidth || gameSize.width, previousHeight || gameSize.height);
+    const next = computeArena(gameSize.width, gameSize.height);
+    const scale = next.radius / old.radius;
+    this.ball.set(
+      next.center.x + (this.ball.x - old.center.x) * scale,
+      next.center.y + (this.ball.y - old.center.y) * scale
+    );
+    // Velocity magnitude is intentionally left unchanged; paddle angles are
+    // radians and need no remap. Stale trail points would smear, so drop them.
+    this.ballTrail = [];
+    this.paddleImpactBursts = [];
   }
 
   private handleStartEvent = () => {
     this.startGame();
+  };
+
+  // Arcade HOME overlay (hub-injected /__arcade/home.js). Safe no-ops if the
+  // overlay script never loads: these events simply never fire.
+  private handleHomeOpen = () => {
+    this.homeOverlayOpen = true;
+    this.pausedByHomeOverlay = this.mode === "playing";
+    if (this.pausedByHomeOverlay) {
+      this.mode = "paused";
+      this.message = "Paused for the arcade menu.";
+      this.emitHud();
+    }
+    // While the clean HOME overlay is up, suppress the game's OWN pause-menu
+    // card so the owner never sees two stacked menus. The card otherwise shows
+    // whenever mode !== "playing" (see the four-pong:hud handler). CSS keys off
+    // this body class to force #menu-overlay hidden.
+    document.body.classList.add("arcade-home-active");
+    // Mute everything (SFX one-shots included); music pauses itself via the
+    // mode !== "playing" check in updateMusic().
+    this.prevSoundMute = this.sound.mute;
+    this.sound.mute = true;
+  };
+
+  private handleHomeClose = () => {
+    this.sound.mute = this.prevSoundMute;
+    // Restore the game's own pause-menu card (Esc / Pause-button pauses show it
+    // again as normal).
+    document.body.classList.remove("arcade-home-active");
+    if (this.pausedByHomeOverlay && this.mode === "paused") {
+      this.mode = "playing";
+      this.message = "Back in motion.";
+      this.resumeRoundIfStalled();
+      this.emitHud();
+    }
+    this.pausedByHomeOverlay = false;
+    // Keep the flag set until after this keydown dispatch finishes: the
+    // overlay closes on the same Esc press the game's keydown handler will
+    // still see, and it must ignore it instead of re-pausing.
+    window.setTimeout(() => {
+      this.homeOverlayOpen = false;
+    }, 0);
   };
 
   private handlePauseEvent = () => {
@@ -1664,6 +2072,13 @@ class FourPongScene extends Phaser.Scene {
     }
   };
 
+  private handleCenterShapeEvent = (event: Event) => {
+    const shape = (event as CustomEvent<CenterShape>).detail;
+    if (shape === "triangle" || shape === "trinity") {
+      this.setCenterShape(shape);
+    }
+  };
+
   private handleThemeEvent = (event: Event) => {
     const themeId = (event as CustomEvent<ThemeId>).detail;
     if (themeId in THEMES) {
@@ -1685,20 +2100,116 @@ class FourPongScene extends Phaser.Scene {
     }
   };
 
+  private handleSetNameEvent = (event: Event) => {
+    const detail = (event as CustomEvent<{ name: string }>).detail;
+    if (detail && typeof detail.name === "string") {
+      this.setPlayerName(detail.name);
+    }
+  };
+
+  /**
+   * Set the local display name: sanitize, persist, push to the server (live
+   * rename if connected), and refresh the HUD. A blank entry falls back to a
+   * fresh random name so a player is never left nameless.
+   */
+  private setPlayerName(raw: string) {
+    const clean = sanitizePlayerName(raw) || randomPlayerName();
+    this.playerName = clean;
+    storePlayerName(clean);
+    this.net?.setName(clean);
+    // Reflect immediately in our own roster row offline (online the server
+    // echoes the new name back via {room}); harmless to set in both.
+    const localSlot = this.networked && this.net ? this.net.slot : 0;
+    if (localSlot >= 0 && this.players[localSlot]) {
+      this.players[localSlot].name = clean;
+    }
+    this.emitHud();
+  }
+
   private handleWindowKeyDown = (event: KeyboardEvent) => {
+    if (this.homeOverlayOpen) {
+      return;
+    }
+
     if (event.repeat) {
       return;
     }
 
-    if (event.key === "Escape") {
+    // M opens the game's OWN menu/pause card (Resume + Bot Fill + Settings).
+    // Esc is reserved for the arcade HOME (Wii) overlay, which binds Esc itself
+    // (the overlay <script> no longer carries data-esc="off"), so we never touch
+    // Escape here — it falls straight through to the overlay.
+    if (event.code === "KeyM") {
       event.preventDefault();
       this.togglePause();
       return;
     }
 
+    // ONLINE session screens own Space first: spectator jump-in, ready toggle,
+    // countdown cancel. handleSessionSpace returns true only when one of those
+    // screens is active, so in live networked play Space falls through and
+    // stays the charged-catch key (read via this.keys.pause in updateNetworked).
+    if (event.code === "Space" && this.handleSessionSpace()) {
+      event.preventDefault();
+      return;
+    }
+
+    // Space still toggles pause while we're not actively playing (e.g. resume
+    // from the pause screen).
     if (event.code === "Space" && this.mode !== "playing") {
       event.preventDefault();
       this.togglePause();
+    }
+  };
+
+  /**
+   * Space, scoped to the online session screens. Returns true when consumed:
+   *   - spectator → {t:"join"} ("Jump in?"); ignored while already pending
+   *   - seated on the lobby/matchOver ready screen → toggle {t:"ready"}
+   *   - seated during the 3-2-1 → ready(false), which cancels the countdown
+   * Returns false while offline, locally paused (pause card owns Space), or in
+   * live play (Space is the catch key there).
+   */
+  private handleSessionSpace(): boolean {
+    const net = this.net;
+    if (!this.networked || !net || net.state !== "open") {
+      return false;
+    }
+    if (this.mode === "paused") {
+      return false;
+    }
+    if (net.slot < 0) {
+      if (!net.joinPending) {
+        net.sendJoin();
+      }
+      return true; // consume even while pending — no double-join, no pause leak
+    }
+    if (net.mode === "lobby" || net.mode === "matchOver") {
+      net.sendReady(!(net.self?.ready ?? false));
+      return true;
+    }
+    if (net.mode === "countdown") {
+      net.sendReady(false);
+      return true;
+    }
+    return false;
+  }
+
+  private handleJoinEvent = () => {
+    if (this.networked && this.net && this.net.slot < 0) {
+      this.net.sendJoin();
+    }
+  };
+
+  private handleReadyToggleEvent = () => {
+    const net = this.net;
+    if (!this.networked || !net || net.slot < 0) {
+      return;
+    }
+    if (net.mode === "lobby" || net.mode === "matchOver") {
+      net.sendReady(!(net.self?.ready ?? false));
+    } else if (net.mode === "countdown") {
+      net.sendReady(false);
     }
   };
 
@@ -1713,83 +2224,175 @@ class FourPongScene extends Phaser.Scene {
       themeId: this.themeId,
       triangleMotionMode: this.triangleMotionMode,
       musicVolume: this.musicVolume,
-      sfxVolume: this.sfxVolume
+      sfxVolume: this.sfxVolume,
+      playerName: this.playerName,
+      localSlot: this.localSlot(),
+      netSession: this.networked && this.mode !== "paused"
     };
 
     window.dispatchEvent(new CustomEvent<HudState>("four-pong:hud", { detail: state }));
-  }
-}
-
-function normalizeAngle(angle: number) {
-  return Phaser.Math.Wrap(angle, 0, TAU);
-}
-
-function angleInArc(angle: number, start: number, end: number) {
-  const normalized = normalizeAngle(angle);
-  const normalizedStart = normalizeAngle(start);
-  const span = end - start;
-  const relative = normalizeAngle(normalized - normalizedStart);
-  return relative <= span;
-}
-
-function clampAngleToArc(angle: number, start: number, end: number, margin: number) {
-  const normalizedStart = normalizeAngle(start);
-  const span = end - start;
-  const relative = normalizeAngle(normalizeAngle(angle) - normalizedStart);
-  const clamped = Phaser.Math.Clamp(relative, margin, Math.max(margin, span - margin));
-  return normalizeAngle(normalizedStart + clamped);
-}
-
-function shortestAngleDelta(from: number, to: number) {
-  return Phaser.Math.Angle.Wrap(to - from);
-}
-
-function pointOnCircle(center: Phaser.Math.Vector2, angle: number, radius: number) {
-  return new Phaser.Math.Vector2(
-    center.x + Math.cos(angle) * radius,
-    center.y + Math.sin(angle) * radius
-  );
-}
-
-function closestPointOnSegment(point: Phaser.Math.Vector2, start: Phaser.Math.Vector2, end: Phaser.Math.Vector2) {
-  const segment = end.clone().subtract(start);
-  const lengthSq = segment.lengthSq();
-  if (lengthSq === 0) {
-    return start.clone();
+    this.emitSession();
   }
 
-  const t = Phaser.Math.Clamp(point.clone().subtract(start).dot(segment) / lengthSq, 0, 1);
-  return start.clone().add(segment.scale(t));
-}
+  /**
+   * Project the net-session state into the DOM layer's SessionUiState. All
+   * screens collapse to hidden while offline or locally paused (the pause card
+   * takes the overlay); the HOME overlay hides everything via the
+   * body.arcade-home-active CSS class instead.
+   */
+  private emitSession() {
+    const net = this.net;
+    const s: SessionUiState = {
+      banner: "none",
+      showPanel: false,
+      kicker: "Four Ponq",
+      offline: !this.networked,
+      paused: this.mode === "paused",
+      primaryAction: "none",
+      primaryLabel: "",
+      rulesEditable: false,
+      statusLine: "",
+      matchOver: false,
+      resultLine: "",
+      rows: [],
+      selfReady: false,
+      waitingFor: 0,
+      countdown: null,
+      seated: false,
+      isHost: false,
+      difficulty: this.botDifficulty,
+      gameVariant: this.gameVariant,
+      triangleMotion: this.triangleMotionMode,
+      centerShape: this.centerShape,
+      botFill: this.botFill,
+      themeId: this.themeId,
+      musicVolume: this.musicVolume,
+      sfxVolume: this.sfxVolume,
+      playerName: this.playerName
+    };
 
-function closestPointsBetweenSegments(
-  aStart: Phaser.Math.Vector2,
-  aEnd: Phaser.Math.Vector2,
-  bStart: Phaser.Math.Vector2,
-  bEnd: Phaser.Math.Vector2
-) {
-  let bestA = aStart.clone();
-  let bestB = bStart.clone();
-  let bestDistance = Infinity;
+    const dispatch = () =>
+      window.dispatchEvent(new CustomEvent<SessionUiState>("four-pong:session", { detail: s }));
 
-  const candidates = [
-    { a: aStart, b: closestPointOnSegment(aStart, bStart, bEnd) },
-    { a: aEnd, b: closestPointOnSegment(aEnd, bStart, bEnd) },
-    { a: closestPointOnSegment(bStart, aStart, aEnd), b: bStart },
-    { a: closestPointOnSegment(bEnd, aStart, aEnd), b: bEnd }
-  ];
+    // --- NETWORKED ---
+    if (this.networked && net && net.state === "open") {
+      // Locally paused mid-match (M) → the menu shows the live roster + read-only
+      // rules + a Resume action (server only allows rule changes on ready screens).
+      if (this.mode === "paused") {
+        s.showPanel = true;
+        s.kicker = "Paused";
+        s.primaryAction = "resume";
+        s.primaryLabel = "Resume (M)";
+        s.statusLine = "Press M or Esc to resume.";
+        s.rows = this.sessionRowsFromNet(net);
+        s.difficulty = net.difficulty;
+        s.gameVariant = net.gameVariant;
+        s.triangleMotion = net.triangleMotion;
+        s.centerShape = net.centerShape;
+        s.botFill = net.botFill;
+        dispatch();
+        return;
+      }
 
-  for (const candidate of candidates) {
-    const distance = candidate.a.distance(candidate.b);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestA = candidate.a.clone();
-      bestB = candidate.b.clone();
+      s.seated = net.slot >= 0;
+      if (net.slot < 0) {
+        s.banner = net.joinPending ? "pending" : "watching";
+      }
+      if (net.mode === "countdown") {
+        s.countdown = net.countdown ?? COUNTDOWN_SECONDS;
+      }
+      // Ready screen (lobby / matchOver), seated: the load-in lobby panel.
+      if (net.slot >= 0 && (net.mode === "lobby" || net.mode === "matchOver")) {
+        s.showPanel = true;
+        s.matchOver = net.mode === "matchOver";
+        s.kicker = s.matchOver ? "Match over" : "Online lobby";
+        s.isHost = net.isHost;
+        s.rulesEditable = net.isHost;
+        s.difficulty = net.difficulty;
+        s.gameVariant = net.gameVariant;
+        s.triangleMotion = net.triangleMotion;
+        s.centerShape = net.centerShape;
+        s.botFill = net.botFill;
+        s.resultLine = s.matchOver ? this.lastResultLine || "Match over." : "";
+        s.rows = this.sessionRowsFromNet(net);
+        s.selfReady = net.self?.ready ?? false;
+        s.waitingFor = net.players.filter((p) => !p.isBot && p.connected && !p.ready).length;
+        s.primaryAction = "ready";
+        s.primaryLabel = s.selfReady ? "Ready ✓ (Space to cancel)" : "Ready (Space)";
+        s.statusLine = !s.selfReady
+          ? "Press Space when you're ready."
+          : s.waitingFor > 0
+            ? `Waiting for ${s.waitingFor} more player${s.waitingFor === 1 ? "" : "s"}…`
+            : "All set — starting…";
+      }
+      dispatch();
+      return;
     }
+
+    // --- OFFLINE: local hot-seat menu, but ONLY once the connection has
+    // genuinely FAILED (closed/error) — never during the initial connect
+    // handshake, which used to flash a misleading "Server offline — Start" card
+    // for a frame on every load. While still connecting we show nothing (the
+    // status chip already reads "Connecting to the arcade server…").
+    const netDead = !!net && (net.state === "closed" || net.state === "error");
+    if (netDead && this.mode !== "playing") {
+      s.showPanel = true;
+      s.offline = true;
+      s.rows = this.sessionRowsOffline();
+      if (this.mode === "paused") {
+        s.kicker = "Paused";
+        s.primaryAction = "resume";
+        s.primaryLabel = "Resume (M)";
+        s.statusLine = "Press M or Esc to resume.";
+      } else if (this.mode === "matchOver") {
+        s.kicker = "Match over";
+        s.rulesEditable = true; // you're the local host
+        s.primaryAction = "start";
+        s.primaryLabel = "Start Again";
+        s.statusLine = "Press Space or Start to play again.";
+      } else {
+        s.kicker = "Local play";
+        s.rulesEditable = true;
+        s.primaryAction = "start";
+        s.primaryLabel = "Start";
+        s.statusLine = "Server offline — local hot-seat. Press Start.";
+      }
+    }
+    dispatch();
   }
 
-  return { a: bestA, b: bestB, distance: bestDistance };
+  /** Roster rows from the live server players (sorted by slot). */
+  private sessionRowsFromNet(net: NetClient): SessionRowState[] {
+    return [...net.players]
+      .sort((a, b) => a.slot - b.slot)
+      .map((p) => ({
+        slot: p.slot,
+        name: p.name || `P${p.slot + 1}`,
+        isBot: p.isBot,
+        connected: p.connected,
+        ready: p.ready,
+        isSelf: p.slot === net.slot,
+        cssColor: this.players[p.slot]?.cssColor ?? "#ffffff"
+      }));
+  }
+
+  /** Roster rows for the offline hot-seat menu (slot 0 = you, others bots if filled). */
+  private sessionRowsOffline(): SessionRowState[] {
+    return this.players.map((p, slot) => ({
+      slot,
+      name: slot === 0 ? this.playerName : `P${slot + 1}`,
+      isBot: slot !== 0 && this.botFill,
+      connected: slot === 0,
+      ready: false,
+      isSelf: slot === 0,
+      cssColor: p.cssColor
+    }));
+  }
 }
+
+// The simulation/geometry helper functions that used to live here moved to
+// src/sim/ (math.ts / geometry.ts / physics.ts / bot.ts) as pure modules.
+// Only render-side helpers remain below.
 
 function rotateVector(vector: Phaser.Math.Vector2, radians: number) {
   const cos = Math.cos(radians);
@@ -1800,19 +2403,6 @@ function rotateVector(vector: Phaser.Math.Vector2, radians: number) {
   );
 }
 
-function pointInTriangle(point: Phaser.Math.Vector2, a: Phaser.Math.Vector2, b: Phaser.Math.Vector2, c: Phaser.Math.Vector2) {
-  const area = triangleSign(point, a, b);
-  const sideB = triangleSign(point, b, c);
-  const sideC = triangleSign(point, c, a);
-  const hasNegative = area < 0 || sideB < 0 || sideC < 0;
-  const hasPositive = area > 0 || sideB > 0 || sideC > 0;
-  return !(hasNegative && hasPositive);
-}
-
-function triangleSign(p1: Phaser.Math.Vector2, p2: Phaser.Math.Vector2, p3: Phaser.Math.Vector2) {
-  return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
-}
-
 const game = new Phaser.Game({
   type: Phaser.CANVAS,
   parent: "game-root",
@@ -1820,8 +2410,7 @@ const game = new Phaser.Game({
   scale: {
     mode: Phaser.Scale.RESIZE,
     parent: "game-root",
-    width: "100%",
-    height: "100%"
+    autoRound: true
   },
   scene: FourPongScene,
   render: {
@@ -1833,39 +2422,161 @@ const game = new Phaser.Game({
 const scoreStrip = document.querySelector<HTMLDivElement>("#score-strip")!;
 const statusChip = document.querySelector<HTMLDivElement>("#status-chip")!;
 const pauseButton = document.querySelector<HTMLButtonElement>("#pause-button")!;
-const menuOverlay = document.querySelector<HTMLDivElement>("#menu-overlay")!;
-const startButton = document.querySelector<HTMLButtonElement>("#start-button")!;
-const botToggleButton = document.querySelector<HTMLButtonElement>("#bot-toggle-button")!;
-const menuBotState = document.querySelector<HTMLSpanElement>("#menu-bot-state")!;
-const menuTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-menu-tab]"));
-const menuTabPanels = Array.from(document.querySelectorAll<HTMLDivElement>("[data-menu-panel]"));
-const difficultyButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-difficulty]"));
-const menuDifficultyState = document.querySelector<HTMLSpanElement>("#menu-difficulty-state")!;
-const gameVariantButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-game-variant]"));
-const menuGameVariantState = document.querySelector<HTMLSpanElement>("#menu-game-variant-state")!;
-const themeButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-theme-choice]"));
-const menuThemeState = document.querySelector<HTMLSpanElement>("#menu-theme-state")!;
-const triangleMotionButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-triangle-motion]"));
-const menuTriangleState = document.querySelector<HTMLSpanElement>("#menu-triangle-state")!;
-const musicVolumeInput = document.querySelector<HTMLInputElement>("#music-volume")!;
-const sfxVolumeInput = document.querySelector<HTMLInputElement>("#sfx-volume")!;
-const menuMusicVolume = document.querySelector<HTMLElement>("#menu-music-volume")!;
-const menuSfxVolume = document.querySelector<HTMLElement>("#menu-sfx-volume")!;
-const menuMusicState = document.querySelector<HTMLElement>("#menu-music-state")!;
+
+// --- Unified menu / online-session layer ------------------------------------
+// ONE panel (Players | Rules two columns + a nested Settings sub-view + a
+// contextual primary action) serves as the load-in lobby, the match-over screen,
+// the M-menu (paused), AND the offline hot-seat menu — plus the spectator banner
+// and 3-2-1 countdown. Injected here, driven by "four-pong:session" events.
+document.querySelector<HTMLElement>("#game-shell")!.insertAdjacentHTML(
+  "beforeend",
+  `<div id="session-overlay" hidden>
+    <div class="session-banner" id="session-banner" hidden>
+      <span class="live-dot" aria-hidden="true"></span>
+      <span id="session-banner-text">LIVE — watching</span>
+      <button id="session-join-button" type="button">Jump In (Space)</button>
+    </div>
+    <div class="session-panel" id="session-panel" role="dialog" aria-label="Menu" hidden>
+      <div id="session-main">
+        <span class="mode-kicker" id="session-kicker">Online lobby</span>
+        <h2 id="session-result" hidden></h2>
+        <div class="session-cols">
+          <div class="session-col">
+            <span class="session-col-label">Players</span>
+            <ul id="session-roster"></ul>
+          </div>
+          <div class="session-col">
+            <span class="session-col-label" id="session-settings-label">Rules</span>
+            <div class="session-settings" id="session-settings">
+              <div class="session-setting">
+                <span class="session-setting-name">CPU</span>
+                <div class="session-setting-options" data-setting="difficulty">
+                  <button type="button" data-difficulty="easy">Easy</button>
+                  <button type="button" data-difficulty="medium">Medium</button>
+                  <button type="button" data-difficulty="hard">Hard</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Mode</span>
+                <div class="session-setting-options" data-setting="gameVariant">
+                  <button type="button" data-game-variant="classic">Classic</button>
+                  <button type="button" data-game-variant="rotating">Orbit</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Triangle</span>
+                <div class="session-setting-options" data-setting="triangleMotion">
+                  <button type="button" data-triangle-motion="steady">Steady</button>
+                  <button type="button" data-triangle-motion="reactive">Reactive</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Center</span>
+                <div class="session-setting-options" data-setting="centerShape">
+                  <button type="button" data-center-shape="triangle">Triangle</button>
+                  <button type="button" data-center-shape="trinity">Hollow</button>
+                </div>
+              </div>
+              <div class="session-setting">
+                <span class="session-setting-name">Bots</span>
+                <div class="session-setting-options">
+                  <button type="button" id="session-bots-button">Bots: On</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="session-actions">
+          <button id="session-settings-toggle" type="button" class="ghost">⚙ Settings</button>
+          <button id="session-primary" type="button">Ready (Space)</button>
+        </div>
+        <p id="session-status">Press Space when you're ready.</p>
+      </div>
+      <div id="session-settings-view" hidden>
+        <span class="mode-kicker">Settings</span>
+        <div class="settings-row">
+          <span class="settings-row-label">Theme</span>
+          <div class="theme-grid">
+            <button class="active" type="button" data-theme-choice="neon"><span class="theme-swatch neon"></span>Neon</button>
+            <button type="button" data-theme-choice="solar"><span class="theme-swatch solar"></span>Solar</button>
+            <button type="button" data-theme-choice="deepSea"><span class="theme-swatch deep-sea"></span>Deep Sea</button>
+            <button type="button" data-theme-choice="candy"><span class="theme-swatch candy"></span>Candy</button>
+            <button type="button" data-theme-choice="mono"><span class="theme-swatch mono"></span>Mono</button>
+          </div>
+        </div>
+        <div class="settings-row">
+          <span class="settings-row-label">Audio</span>
+          <div class="settings-audio">
+            <label class="volume-row"><span>Music</span><input id="music-volume" type="range" min="0" max="100" value="2" /><em id="menu-music-volume">2%</em></label>
+            <label class="volume-row"><span>SFX</span><input id="sfx-volume" type="range" min="0" max="100" value="5" /><em id="menu-sfx-volume">5%</em></label>
+          </div>
+        </div>
+        <div class="settings-row">
+          <span class="settings-row-label">Name</span>
+          <div class="name-row">
+            <input id="player-name-input" type="text" maxlength="12" autocomplete="off" spellcheck="false" placeholder="Your name" aria-label="Your display name" />
+            <button type="button" id="player-name-random" aria-label="Pick a random name">Random</button>
+          </div>
+        </div>
+        <div class="session-actions">
+          <button id="session-settings-back" type="button" class="ghost">← Back</button>
+        </div>
+      </div>
+    </div>
+    <div class="session-countdown" id="session-countdown" hidden>
+      <span id="session-countdown-number">3</span>
+      <span class="session-countdown-hint" id="session-countdown-hint">Space — cancel</span>
+    </div>
+  </div>`
+);
+
+const sessionOverlay = document.querySelector<HTMLDivElement>("#session-overlay")!;
+const sessionBanner = document.querySelector<HTMLDivElement>("#session-banner")!;
+const sessionBannerText = document.querySelector<HTMLSpanElement>("#session-banner-text")!;
+const sessionJoinButton = document.querySelector<HTMLButtonElement>("#session-join-button")!;
+const sessionPanel = document.querySelector<HTMLDivElement>("#session-panel")!;
+const sessionMain = document.querySelector<HTMLDivElement>("#session-main")!;
+const sessionSettingsView = document.querySelector<HTMLDivElement>("#session-settings-view")!;
+const sessionSettingsToggle = document.querySelector<HTMLButtonElement>("#session-settings-toggle")!;
+const sessionSettingsBack = document.querySelector<HTMLButtonElement>("#session-settings-back")!;
+const sessionKicker = document.querySelector<HTMLSpanElement>("#session-kicker")!;
+const sessionResult = document.querySelector<HTMLHeadingElement>("#session-result")!;
+const sessionRoster = document.querySelector<HTMLUListElement>("#session-roster")!;
+const sessionPrimary = document.querySelector<HTMLButtonElement>("#session-primary")!;
+const sessionStatus = document.querySelector<HTMLParagraphElement>("#session-status")!;
+const sessionSettings = document.querySelector<HTMLDivElement>("#session-settings")!;
+const sessionSettingsLabel = document.querySelector<HTMLSpanElement>("#session-settings-label")!;
+const sessionBotsButton = document.querySelector<HTMLButtonElement>("#session-bots-button")!;
+const sessionCountdown = document.querySelector<HTMLDivElement>("#session-countdown")!;
+const sessionCountdownNumber = document.querySelector<HTMLSpanElement>("#session-countdown-number")!;
+const sessionCountdownHint = document.querySelector<HTMLSpanElement>("#session-countdown-hint")!;
+// Cosmetic controls now live inside the panel's nested Settings sub-view.
+const themeButtons = Array.from(sessionSettingsView.querySelectorAll<HTMLButtonElement>("[data-theme-choice]"));
+const musicVolumeInput = sessionSettingsView.querySelector<HTMLInputElement>("#music-volume")!;
+const sfxVolumeInput = sessionSettingsView.querySelector<HTMLInputElement>("#sfx-volume")!;
+const playerNameInput = sessionSettingsView.querySelector<HTMLInputElement>("#player-name-input")!;
+const playerNameRandomButton = sessionSettingsView.querySelector<HTMLButtonElement>("#player-name-random")!;
+const menuMusicVolume = sessionSettingsView.querySelector<HTMLElement>("#menu-music-volume")!;
+const menuSfxVolume = sessionSettingsView.querySelector<HTMLElement>("#menu-sfx-volume")!;
 
 window.addEventListener("four-pong:hud", (event) => {
   const state = (event as CustomEvent<HudState>).detail;
-  scoreStrip.innerHTML = state.players.map((player) => {
-    const shields = Array.from({ length: MAX_SHIELDS }, (_, index) => {
-      const live = index < player.shields;
+  scoreStrip.innerHTML = state.players.map((player, index) => {
+    const shields = Array.from({ length: MAX_SHIELDS }, (_, i) => {
+      const live = i < player.shields;
       return `<span class="pip ${live ? "live" : ""}" style="--player-color: ${player.cssColor}"></span>`;
     }).join("");
-    const charge = Phaser.Math.Clamp(player.charge / MAX_CHARGE, 0, 1);
-    return `<article class="score-card ${player.eliminated ? "out" : ""}">
-      <span class="name" style="--player-color: ${player.cssColor}">${player.name}</span>
+    // Fill the meter against the *ready* threshold so a full bar literally means
+    // "your super is ready" (see CHARGE_READY_AT).
+    const charge = Phaser.Math.Clamp(player.charge / CHARGE_READY_AT, 0, 1);
+    const ready = player.charge >= CHARGE_READY_AT;
+    const isSelf = index === state.localSlot;
+    return `<article class="score-card ${player.eliminated ? "out" : ""} ${isSelf ? "is-self" : ""}">
+      <span class="name" style="--player-color: ${player.cssColor}">${escapeHtml(player.name)}${isSelf ? '<span class="you-tag">you</span>' : ""}</span>
       <span class="pips">${shields}</span>
-      <span class="charge-meter" aria-label="${player.name} charge ${player.charge} of ${MAX_CHARGE}">
-        <span style="--player-color: ${player.cssColor}; --charge: ${charge}"></span>
+      <span class="charge-meter ${ready ? "ready" : ""}" style="--player-color: ${player.cssColor}" aria-label="${player.name} super ${ready ? "ready" : `charging ${player.charge} of ${CHARGE_READY_AT}`}">
+        <span class="charge-fill" style="--charge: ${charge}"></span>
+        <span class="charge-label">SUPER</span>
       </span>
     </article>`;
   }).join("");
@@ -1873,78 +2584,204 @@ window.addEventListener("four-pong:hud", (event) => {
   statusChip.textContent = `${state.message} ${state.botFill ? "Bot fill on." : "Bot fill off."}`;
   pauseButton.textContent = state.mode === "paused" ? "Resume" : "Pause";
   pauseButton.disabled = state.mode === "menu" || state.mode === "matchOver";
-  menuOverlay.hidden = state.mode === "playing";
-  startButton.textContent = state.mode === "paused" ? "Resume" : state.mode === "matchOver" ? "Start Again" : "Start";
-  botToggleButton.textContent = state.botFill ? "Bot Fill: On" : "Bot Fill: Off";
-  menuBotState.textContent = state.botFill ? "On" : "Off";
-  menuDifficultyState.textContent = titleCase(state.botDifficulty);
-  menuGameVariantState.textContent = state.gameVariant === "rotating" ? "Orbit" : "Classic";
-  menuThemeState.textContent = THEMES[state.themeId].name;
-  menuTriangleState.textContent = titleCase(state.triangleMotionMode);
-  const musicPercent = Math.round(state.musicVolume * 100);
-  const sfxPercent = Math.round(state.sfxVolume * 100);
-  musicVolumeInput.value = String(musicPercent);
-  sfxVolumeInput.value = String(sfxPercent);
-  menuMusicVolume.textContent = `${musicPercent}%`;
-  menuSfxVolume.textContent = `${sfxPercent}%`;
-  menuMusicState.textContent = `${musicPercent}%`;
   document.body.dataset.theme = THEMES[state.themeId].shellTheme;
-  difficultyButtons.forEach((button) => {
-    const active = button.dataset.difficulty === state.botDifficulty;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  gameVariantButtons.forEach((button) => {
-    const active = button.dataset.gameVariant === state.gameVariant;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  themeButtons.forEach((button) => {
-    const active = button.dataset.themeChoice === state.themeId;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
-  triangleMotionButtons.forEach((button) => {
-    const active = button.dataset.triangleMotion === state.triangleMotionMode;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-pressed", String(active));
-  });
 });
 
-startButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:start"));
-});
+// --- Unified menu / session renderer -----------------------------------------
+// The scene emits "four-pong:session" on every HUD refresh; memoize on the
+// serialized state so the DOM only changes when the menu actually does.
+let lastSessionKey = "";
+let settingsOpen = false;
+function applySettingsView() {
+  sessionMain.hidden = settingsOpen;
+  sessionSettingsView.hidden = !settingsOpen;
+}
 
-botToggleButton.addEventListener("click", () => {
-  window.dispatchEvent(new Event("four-pong:toggle-bots"));
-});
+window.addEventListener("four-pong:session", (event) => {
+  const s = (event as CustomEvent<SessionUiState>).detail;
+  const key = JSON.stringify(s);
+  if (key === lastSessionKey) {
+    return;
+  }
+  lastSessionKey = key;
 
-menuTabs.forEach((button) => {
-  button.addEventListener("click", () => {
-    const target = button.dataset.menuTab;
-    menuTabs.forEach((entry) => entry.classList.toggle("active", entry === button));
-    menuTabPanels.forEach((panel) => {
-      panel.hidden = panel.dataset.menuPanel !== target;
+  sessionOverlay.hidden = s.banner === "none" && !s.showPanel && s.countdown === null;
+  sessionBanner.hidden = s.banner === "none";
+  sessionPanel.hidden = !s.showPanel;
+  sessionCountdown.hidden = s.countdown === null;
+
+  // Always start the panel on the main view; the nested Settings sub-view is a
+  // momentary drill-in that resets whenever the menu closes.
+  if (!s.showPanel && settingsOpen) {
+    settingsOpen = false;
+  }
+  applySettingsView();
+
+  if (s.banner === "watching") {
+    sessionBannerText.textContent = "LIVE — watching · press Space to jump in";
+    sessionJoinButton.hidden = false;
+  } else if (s.banner === "pending") {
+    sessionBannerText.textContent = "Joining at next serve…";
+    sessionJoinButton.hidden = true;
+  }
+
+  if (s.showPanel) {
+    sessionKicker.textContent = s.kicker;
+    sessionResult.hidden = !s.matchOver;
+    sessionResult.textContent = s.resultLine;
+    sessionRoster.innerHTML = s.rows
+      .map((row) => {
+        const tag = row.isBot
+          ? `<span class="tag bot">BOT</span>`
+          : s.offline
+            ? row.isSelf
+              ? `<span class="tag ready">YOU</span>`
+              : `<span class="tag offline">OPEN</span>`
+            : !row.connected
+              ? `<span class="tag offline">OFFLINE</span>`
+              : row.ready
+                ? `<span class="tag ready">READY</span>`
+                : `<span class="tag waiting">&hellip;</span>`;
+        return `<li class="${row.isSelf ? "self" : ""}" style="--player-color: ${row.cssColor}">
+          <span class="seat">P${row.slot + 1}</span>
+          <span class="player-name">${escapeHtml(row.name)}${row.isSelf ? " (you)" : ""}</span>
+          ${tag}
+        </li>`;
+      })
+      .join("");
+
+    // Primary action button (Ready / Resume / Start), contextual.
+    sessionPrimary.hidden = s.primaryAction === "none";
+    sessionPrimary.textContent = s.primaryLabel;
+    sessionPrimary.dataset.action = s.primaryAction;
+    sessionPrimary.classList.toggle("armed", s.primaryAction === "ready" && s.selfReady);
+    sessionStatus.textContent = s.statusLine;
+
+    // Rules chips: highlight the current value; clickable only when editable
+    // (offline, or networked host on a ready screen).
+    const markSetting = (settingKey: string, current: string) => {
+      sessionSettings.querySelectorAll<HTMLButtonElement>(`[data-setting="${settingKey}"] button`).forEach((btn) => {
+        const val = btn.dataset.difficulty ?? btn.dataset.gameVariant ?? btn.dataset.triangleMotion ?? btn.dataset.centerShape ?? "";
+        btn.classList.toggle("active", val === current);
+        btn.disabled = !s.rulesEditable;
+      });
+    };
+    markSetting("difficulty", s.difficulty);
+    markSetting("gameVariant", s.gameVariant);
+    markSetting("triangleMotion", s.triangleMotion);
+    markSetting("centerShape", s.centerShape);
+    sessionBotsButton.textContent = `Bots: ${s.botFill ? "On" : "Off"}`;
+    sessionBotsButton.classList.toggle("active", s.botFill);
+    sessionBotsButton.disabled = !s.rulesEditable;
+    sessionSettingsLabel.textContent = s.offline
+      ? "Rules"
+      : s.paused
+        ? "Rules — change between rounds"
+        : s.rulesEditable
+          ? "Rules — you're the host"
+          : "Rules — host (P1) sets them";
+    sessionSettings.classList.toggle("readonly", !s.rulesEditable);
+
+    // Cosmetic Settings sub-view (per-client; always editable).
+    themeButtons.forEach((btn) => {
+      const active = btn.dataset.themeChoice === s.themeId;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", String(active));
     });
-  });
+    const musicPct = Math.round(s.musicVolume * 100);
+    const sfxPct = Math.round(s.sfxVolume * 100);
+    musicVolumeInput.value = String(musicPct);
+    sfxVolumeInput.value = String(sfxPct);
+    menuMusicVolume.textContent = `${musicPct}%`;
+    menuSfxVolume.textContent = `${sfxPct}%`;
+    if (document.activeElement !== playerNameInput) {
+      playerNameInput.value = s.playerName;
+    }
+  }
+
+  if (s.countdown !== null) {
+    sessionCountdownHint.hidden = !s.seated;
+    const text = String(Math.max(1, Math.ceil(s.countdown)));
+    if (sessionCountdownNumber.textContent !== text) {
+      sessionCountdownNumber.textContent = text;
+      // Restart the pop animation for each new digit.
+      sessionCountdownNumber.classList.remove("pop");
+      void sessionCountdownNumber.offsetWidth;
+      sessionCountdownNumber.classList.add("pop");
+    }
+  }
 });
 
-difficultyButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const difficulty = button.dataset.difficulty;
-    if (difficulty === "easy" || difficulty === "medium" || difficulty === "hard") {
-      window.dispatchEvent(new CustomEvent<BotDifficulty>("four-pong:set-difficulty", { detail: difficulty }));
-    }
-  });
+sessionJoinButton.addEventListener("click", () => {
+  window.dispatchEvent(new Event("four-pong:join"));
+  sessionJoinButton.blur(); // keep a later Space from re-clicking the button
 });
 
-gameVariantButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const variant = button.dataset.gameVariant;
-    if (variant === "classic" || variant === "rotating") {
-      window.dispatchEvent(new CustomEvent<GameVariant>("four-pong:set-game-variant", { detail: variant }));
+// One contextual primary button → Ready / Resume / Start depending on context.
+sessionPrimary.addEventListener("click", () => {
+  const action = sessionPrimary.dataset.action;
+  if (action === "ready") {
+    window.dispatchEvent(new Event("four-pong:ready-toggle"));
+  } else if (action === "resume") {
+    window.dispatchEvent(new Event("four-pong:toggle-pause"));
+  } else if (action === "start") {
+    window.dispatchEvent(new Event("four-pong:start"));
+  }
+  sessionPrimary.blur(); // Space must hit the window handler, not this button
+});
+
+sessionSettingsToggle.addEventListener("click", () => {
+  settingsOpen = true;
+  applySettingsView();
+  sessionSettingsToggle.blur();
+});
+sessionSettingsBack.addEventListener("click", () => {
+  settingsOpen = false;
+  applySettingsView();
+  sessionSettingsBack.blur();
+});
+
+// Rule controls dispatch the SAME four-pong:set-* events as before; the scene's
+// setters host-gate + route them to the server when networked.
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-difficulty]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.difficulty;
+    if (v === "easy" || v === "medium" || v === "hard") {
+      window.dispatchEvent(new CustomEvent<BotDifficulty>("four-pong:set-difficulty", { detail: v }));
     }
+    b.blur();
   });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-game-variant]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.gameVariant;
+    if (v === "classic" || v === "rotating") {
+      window.dispatchEvent(new CustomEvent<GameVariant>("four-pong:set-game-variant", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-center-shape]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.centerShape;
+    if (v === "triangle" || v === "trinity") {
+      window.dispatchEvent(new CustomEvent<CenterShape>("four-pong:set-center-shape", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionSettings.querySelectorAll<HTMLButtonElement>("[data-triangle-motion]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const v = b.dataset.triangleMotion;
+    if (v === "steady" || v === "reactive") {
+      window.dispatchEvent(new CustomEvent<TriangleMotionMode>("four-pong:set-triangle-motion", { detail: v }));
+    }
+    b.blur();
+  });
+});
+sessionBotsButton.addEventListener("click", () => {
+  window.dispatchEvent(new Event("four-pong:toggle-bots"));
+  sessionBotsButton.blur();
 });
 
 themeButtons.forEach((button) => {
@@ -1953,15 +2790,7 @@ themeButtons.forEach((button) => {
     if (themeId && themeId in THEMES) {
       window.dispatchEvent(new CustomEvent<ThemeId>("four-pong:set-theme", { detail: themeId as ThemeId }));
     }
-  });
-});
-
-triangleMotionButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    const mode = button.dataset.triangleMotion;
-    if (mode === "steady" || mode === "reactive") {
-      window.dispatchEvent(new CustomEvent<TriangleMotionMode>("four-pong:set-triangle-motion", { detail: mode }));
-    }
+    button.blur();
   });
 });
 
@@ -1979,7 +2808,27 @@ function bindVolumeInput(input: HTMLInputElement, target: VolumeTarget) {
 bindVolumeInput(musicVolumeInput, "music");
 bindVolumeInput(sfxVolumeInput, "sfx");
 
+function commitPlayerName(name: string) {
+  window.dispatchEvent(new CustomEvent<{ name: string }>("four-pong:set-name", { detail: { name } }));
+}
+// Commit the typed name when the field loses focus or Enter is pressed (not on
+// every keystroke — that would fire a server rename per character).
+playerNameInput.addEventListener("change", () => commitPlayerName(playerNameInput.value));
+playerNameInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    playerNameInput.blur();
+  }
+});
+playerNameRandomButton.addEventListener("click", () => {
+  const fresh = randomPlayerName();
+  playerNameInput.value = fresh;
+  commitPlayerName(fresh);
+});
+
 pauseButton.addEventListener("click", () => {
+  // The on-screen Pause button toggles the GAME's own pause menu (Resume + Bot
+  // Fill card). The arcade HOME overlay is reached only from its floating house
+  // button (.ah-fab), never from here.
   window.dispatchEvent(new Event("four-pong:toggle-pause"));
 });
 
@@ -1987,4 +2836,59 @@ void game;
 
 function titleCase(value: string) {
   return `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+}
+
+// --- player name (random default, editable, persisted) ----------------------
+
+const PLAYER_NAME_KEY = "four-ponq:player-name";
+const PLAYER_NAME_NOUNS = [
+  "Falcon", "Comet", "Pixel", "Volt", "Ember", "Nova", "Quartz", "Zephyr",
+  "Onyx", "Cobra", "Lynx", "Drift", "Maple", "Rune", "Glyph", "Vapor",
+  "Echo", "Flint", "Bolt", "Wisp", "Jet", "Sage", "Koi", "Pulse"
+] as const;
+
+/** Strip control/non-ASCII chars, trim, cap at 12 (mirrors the server's clamp). */
+function sanitizePlayerName(raw: string): string {
+  return raw.replace(/[^ -~]/g, "").trim().slice(0, 12);
+}
+
+/** A short, friendly random handle like "Volt42" (always <= 12 chars). */
+function randomPlayerName(): string {
+  const noun = PLAYER_NAME_NOUNS[Math.floor(Math.random() * PLAYER_NAME_NOUNS.length)];
+  const suffix = 10 + Math.floor(Math.random() * 90);
+  return `${noun}${suffix}`.slice(0, 12);
+}
+
+/** Read the saved name (sanitized); mint + persist a random one on first run. */
+function loadOrCreatePlayerName(): string {
+  try {
+    const stored = localStorage.getItem(PLAYER_NAME_KEY);
+    const clean = stored ? sanitizePlayerName(stored) : "";
+    if (clean) {
+      return clean;
+    }
+  } catch {
+    // localStorage unavailable (private mode etc.) — fall through to a fresh name.
+  }
+  const fresh = randomPlayerName();
+  storePlayerName(fresh);
+  return fresh;
+}
+
+function storePlayerName(name: string): void {
+  try {
+    localStorage.setItem(PLAYER_NAME_KEY, name);
+  } catch {
+    // Best-effort; a non-persisted name is still fine for the session.
+  }
+}
+
+/** Server-provided names flow into innerHTML — escape them. */
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

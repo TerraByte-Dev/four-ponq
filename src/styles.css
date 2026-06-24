@@ -87,6 +87,14 @@ body,
   margin: 0;
 }
 
+/* Track the dynamic viewport on mobile so browser chrome (URL bar) resizes the shell live. */
+@supports (height: 100dvh) {
+  html,
+  body {
+    height: 100dvh;
+  }
+}
+
 body {
   overflow: hidden;
   background: var(--bg);
@@ -95,8 +103,8 @@ body {
 
 #game-shell {
   position: relative;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
   min-width: 320px;
   min-height: 480px;
   background:
@@ -120,6 +128,9 @@ body {
   top: 14px;
   left: 14px;
   right: 14px;
+  top: max(14px, env(safe-area-inset-top));
+  left: max(14px, env(safe-area-inset-left));
+  right: max(14px, env(safe-area-inset-right));
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -127,8 +138,15 @@ body {
   pointer-events: none;
 }
 
+/*
+ * The per-player lives/super cards now live IN-ARENA, drawn behind each paddle's
+ * section (see drawPaddleClusters in main.ts) — players asked for them "resting
+ * behind the user's section", not stacked in the top-left. The status chip in
+ * #hud stays. The .score-strip rules below are retained (the HUD event still
+ * writes into the hidden node) so this is a one-line, fully reversible hide.
+ */
 .score-strip {
-  display: grid;
+  display: none;
   grid-template-columns: repeat(4, minmax(86px, 1fr));
   gap: 8px;
   max-width: min(620px, calc(100vw - 28px));
@@ -148,6 +166,25 @@ body {
   opacity: 0.46;
 }
 
+/* "Your" card — so the player can find their own lives at a glance. */
+.score-card.is-self {
+  border-color: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28), 0 0 18px rgba(255, 255, 255, 0.12),
+    0 10px 30px rgba(0, 0, 0, 0.28);
+}
+
+.you-tag {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 0.56rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+
 .name {
   display: block;
   margin-bottom: 8px;
@@ -165,8 +202,8 @@ body {
 }
 
 .pip {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
@@ -179,21 +216,57 @@ body {
 }
 
 .charge-meter {
+  position: relative;
   display: block;
   width: 100%;
-  height: 5px;
+  height: 9px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.11);
 }
 
-.charge-meter span {
+.charge-fill {
   display: block;
   width: calc(var(--charge) * 100%);
   height: 100%;
   border-radius: inherit;
   background: var(--player-color);
   box-shadow: 0 0 12px var(--player-color);
+  transition: width 0.12s ease-out;
+}
+
+/* "SUPER" caption sits over the bar; only revealed once the super is ready. */
+.charge-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.5rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: #0a0f14;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.charge-meter.ready {
+  background: var(--player-color);
+  animation: charge-ready-pulse 0.9s ease-in-out infinite;
+}
+
+.charge-meter.ready .charge-label {
+  opacity: 0.92;
+}
+
+@keyframes charge-ready-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 8px var(--player-color);
+  }
+  50% {
+    box-shadow: 0 0 20px var(--player-color);
+  }
 }
 
 .status-chip,
@@ -228,6 +301,8 @@ body {
   z-index: 3;
   right: 14px;
   bottom: 14px;
+  right: max(14px, env(safe-area-inset-right));
+  bottom: max(14px, env(safe-area-inset-bottom));
   min-width: 92px;
   min-height: 42px;
   color: var(--text);
@@ -251,6 +326,8 @@ body {
   z-index: 2;
   left: 14px;
   bottom: 14px;
+  left: max(14px, env(safe-area-inset-left));
+  bottom: max(14px, env(safe-area-inset-bottom));
   display: flex;
   flex-wrap: wrap;
   max-width: min(680px, calc(100vw - 130px));
@@ -288,9 +365,20 @@ body {
   display: none;
 }
 
+/*
+ * While the arcade HOME overlay is open it pauses the game, which would
+ * otherwise surface the game's own pause-menu card (it shows whenever
+ * mode !== "playing"). main.ts toggles this body class on arcade:home-open /
+ * arcade:home-close so only the clean HOME overlay is visible — no double menu.
+ */
+body.arcade-home-active #menu-overlay {
+  display: none;
+}
+
 .menu-panel {
   width: min(440px, calc(100vw - 36px));
   max-height: calc(100vh - 208px);
+  max-height: calc(100dvh - 208px);
   overflow-y: auto;
   padding: 24px;
 }
@@ -564,6 +652,49 @@ body {
   text-align: right;
 }
 
+.name-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.name-row input {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  font: inherit;
+  font-weight: 800;
+}
+
+.name-row input:focus-visible {
+  outline: 2px solid var(--cool);
+  outline-offset: 1px;
+}
+
+.name-row button {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.name-row button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .theme-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -602,11 +733,449 @@ body {
   background: linear-gradient(135deg, #f8f9fa 0 33%, #b8c3c7 33% 66%, #69757c 66%);
 }
 
+/* --- Online session layer (Stage 2): spectator banner, ready panel, 3-2-1 --- */
+
+#session-overlay {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 112px 18px 96px;
+  pointer-events: none;
+}
+
+#session-overlay[hidden] {
+  display: none;
+}
+
+/* The arcade HOME overlay owns the screen while open — same rule as the
+   offline menu card above. */
+body.arcade-home-active #session-overlay {
+  display: none;
+}
+
+.session-banner {
+  position: absolute;
+  top: 96px;
+  top: max(96px, calc(env(safe-area-inset-top) + 82px));
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 24px);
+  padding: 9px 12px;
+  pointer-events: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.session-banner[hidden] {
+  display: none;
+}
+
+.live-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--hot);
+  box-shadow: 0 0 10px var(--hot);
+  animation: session-live-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes session-live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+#session-join-button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  color: #031018;
+  background: var(--cool);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 850;
+  cursor: pointer;
+  box-shadow: 0 0 18px rgba(98, 230, 255, 0.22);
+}
+
+#session-join-button[hidden] {
+  display: none;
+}
+
+#session-join-button:hover {
+  filter: brightness(1.08);
+}
+
+.session-panel {
+  width: min(640px, calc(100vw - 36px));
+  max-height: calc(100vh - 160px);
+  max-height: calc(100dvh - 160px);
+  overflow-y: auto;
+  padding: 22px;
+  pointer-events: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+}
+
+.session-panel[hidden] {
+  display: none;
+}
+
+#session-result {
+  margin: 12px 0 2px;
+  color: var(--text);
+  font-size: 1.45rem;
+  line-height: 1.1;
+}
+
+#session-result[hidden] {
+  display: none;
+}
+
+#session-roster {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 16px;
+  padding: 0;
+  list-style: none;
+}
+
+#session-roster li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+#session-roster li.self {
+  box-shadow: inset 0 0 0 1px var(--player-color);
+}
+
+#session-roster .seat {
+  min-width: 26px;
+  color: var(--player-color);
+  font-weight: 850;
+}
+
+#session-roster .player-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#session-roster .tag {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+}
+
+#session-roster .tag.ready {
+  color: #031018;
+  background: var(--cool);
+  box-shadow: 0 0 12px rgba(98, 230, 255, 0.3);
+}
+
+#session-roster .tag.waiting {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#session-roster .tag.bot {
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.24);
+}
+
+#session-roster .tag.offline {
+  color: var(--hot);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+#session-primary {
+  flex: 1 1 auto;
+  min-height: 48px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #031018;
+  background: var(--cool);
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 850;
+  cursor: pointer;
+  box-shadow: 0 0 26px rgba(98, 230, 255, 0.24);
+}
+
+#session-primary[hidden] {
+  display: none;
+}
+
+#session-primary:hover {
+  filter: brightness(1.08);
+}
+
+#session-primary.armed {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--cool);
+  box-shadow: inset 0 0 14px rgba(98, 230, 255, 0.12);
+}
+
+#session-status {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 650;
+  text-align: center;
+}
+
+/* Host-controlled rule chips, stacked in the panel's right (Rules) column. */
+.session-settings {
+  display: grid;
+  gap: 8px;
+}
+
+.session-settings-label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.session-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.session-setting-name {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.session-setting-options {
+  display: flex;
+  gap: 4px;
+}
+
+.session-setting-options button {
+  min-height: 28px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.session-setting-options button:hover:not(:disabled) {
+  border-color: var(--cool);
+}
+
+.session-setting-options button.active {
+  color: #031018;
+  background: var(--cool);
+  border-color: var(--cool);
+}
+
+.session-setting-options button:disabled {
+  cursor: default;
+}
+
+/* Non-host: rules are read-only chips — dim the options the host didn't pick. */
+.session-settings.readonly .session-setting-options button:disabled:not(.active) {
+  opacity: 0.4;
+}
+
+/* --- Unified panel: two columns (Players | Rules), actions, nested Settings -- */
+#session-main[hidden],
+#session-settings-view[hidden] {
+  display: none;
+}
+
+.session-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 12px;
+  align-items: start;
+}
+
+.session-col {
+  min-width: 0;
+}
+
+.session-col-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.session-col #session-roster {
+  margin: 0;
+}
+
+.session-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 18px;
+}
+
+.session-actions .ghost {
+  flex: 0 0 auto;
+  min-height: 48px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.session-actions .ghost:hover {
+  border-color: var(--cool);
+}
+
+/* Nested Settings sub-view: each control on its own horizontal row, no scroll. */
+.settings-row {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.settings-row-label {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.settings-audio {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.settings-audio .volume-row {
+  margin: 0;
+}
+
+/* Five themes across in one row inside the Settings sub-view. */
+.settings-row .theme-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.settings-row .theme-grid button {
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  text-align: center;
+  padding: 7px 4px;
+  font-size: 0.64rem;
+}
+
+.session-countdown {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.session-countdown[hidden] {
+  display: none;
+}
+
+#session-countdown-number {
+  color: var(--text);
+  font-size: clamp(5.4rem, 20vw, 10rem);
+  font-weight: 900;
+  line-height: 1;
+  text-shadow: 0 0 38px var(--glow-a), 0 0 70px var(--glow-b);
+}
+
+#session-countdown-number.pop {
+  animation: session-count-pop 320ms ease-out;
+}
+
+@keyframes session-count-pop {
+  from {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.session-countdown-hint {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.session-countdown-hint[hidden] {
+  display: none;
+}
+
 @media (max-width: 760px) {
   #hud {
     top: 10px;
     left: 10px;
     right: 10px;
+    top: max(10px, env(safe-area-inset-top));
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
     flex-direction: column;
   }
 
@@ -641,6 +1210,9 @@ body {
     left: 10px;
     right: 10px;
     bottom: 64px;
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(64px, calc(54px + env(safe-area-inset-bottom)));
     max-width: none;
     font-size: 0.7rem;
   }
@@ -648,6 +1220,8 @@ body {
   #pause-button {
     right: 10px;
     bottom: 10px;
+    right: max(10px, env(safe-area-inset-right));
+    bottom: max(10px, env(safe-area-inset-bottom));
   }
 
   #menu-overlay {
@@ -657,6 +1231,7 @@ body {
 
   .menu-panel {
     max-height: calc(100vh - 284px);
+    max-height: calc(100dvh - 284px);
     padding: 18px;
   }
 
@@ -691,5 +1266,40 @@ body {
   .menu-details {
     grid-template-columns: 1fr;
     font-size: 0.72rem;
+  }
+
+  /* The mobile HUD stacks vertically and gets tall — drop the spectator banner
+     to the bottom, above the controls strip, instead of fighting it up top. */
+  .session-banner {
+    top: auto;
+    bottom: 124px;
+    bottom: max(124px, calc(114px + env(safe-area-inset-bottom)));
+    max-width: calc(100vw - 20px);
+    white-space: normal;
+    text-align: center;
+  }
+
+  #session-overlay {
+    padding: 156px 10px 116px;
+  }
+
+  .session-panel {
+    max-height: calc(100vh - 284px);
+    max-height: calc(100dvh - 284px);
+    padding: 18px;
+  }
+
+  /* Narrow screens: stack the two columns and the audio pair vertically. */
+  .session-cols {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .settings-audio {
+    grid-template-columns: 1fr;
+  }
+
+  .session-actions {
+    flex-wrap: wrap;
   }
 }
